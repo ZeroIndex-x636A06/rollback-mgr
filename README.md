@@ -106,9 +106,3 @@ chmod +x uninstall.sh
 ./uninstall.sh
 
 ```
-
-
-
----
-
-**Next Step:** Would you like me to generate the commands for you to initialize your local git repo and push it to GitHub now?
