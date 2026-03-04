@@ -36,7 +36,7 @@ cd ~
 
 2. Clone the repository:
 ```bash
-git clone https://github.com/calebjarrell2006/rollback-mgr.git
+git clone https://github.com/ZeroIndex-x636A06/rollback-mgr.git
 
 ```
 
@@ -95,7 +95,7 @@ cd rollback-mgr
 
 *IF YOU DELETED THE DIRECTORY, RERUN THE CLONE COMMAND:*
 ```bash
-git clone https://github.com/calebjarrell2006/rollback-mgr.git
+git clone https://github.com/ZeroIndex-x636A06/rollback-mgr.git
 
 ```
 
