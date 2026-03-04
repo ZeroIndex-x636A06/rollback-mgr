@@ -231,12 +231,15 @@ perform_downgrade() {
                 if [[ "$snap_ans" =~ ^[Yy]$ ]]; then
                     echo "Querying Debian Snapshot API for $pkg..."
                     
-                    # Use the correct /mr/binary/ endpoint and add try/except safety to Python
-                    local snap_versions=$(curl -sL "https://snapshot.debian.org/mr/binary/$pkg/" | python3 -c "import sys, json; \
-try: \
-d=json.load(sys.stdin); \
-print('\n'.join(x['version'] for x in d.get('result', []))) \
-except: print('')" 2>/dev/null)
+                    # Using clean, multi-line python inside double quotes natively
+                    local snap_versions=$(curl -sL "https://snapshot.debian.org/mr/binary/$pkg/" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print('\n'.join(x['version'] for x in d.get('result', [])))
+except Exception:
+    pass
+" 2>/dev/null)
                     
                     if [ -z "$snap_versions" ]; then
                         echo "No historical versions found."
@@ -249,13 +252,18 @@ except: print('')" 2>/dev/null)
                         local arch=$(dpkg --print-architecture)
                         echo "Finding compiled .deb hash for architecture: $arch..."
                         
-                        # Parse the architecture natively from the JSON response
-                        local hash=$(curl -sL "https://snapshot.debian.org/mr/binary/$pkg/$selected_version/binfiles" | python3 -c "import sys, json; arch=sys.argv[1]; \
-try: \
-d=json.load(sys.stdin); \
-res=[x['hash'] for x in d.get('result', []) if x.get('architecture') in (arch, 'all')]; \
-print(res[0] if res else '') \
-except: print('')" "$arch" 2>/dev/null)
+                        # Fetch the hash matching the exact architecture
+                        local hash=$(curl -sL "https://snapshot.debian.org/mr/binary/$pkg/$selected_version/binfiles" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    arch = '$arch'
+    res = [x['hash'] for x in d.get('result', []) if x.get('architecture') in (arch, 'all')]
+    if res:
+        print(res[0])
+except Exception:
+    pass
+" 2>/dev/null)
                         
                         if [ -z "$hash" ]; then
                             echo "Could not find a pre-compiled .deb for $arch."
