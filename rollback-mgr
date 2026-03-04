@@ -67,6 +67,16 @@ launch_terminal() {
     fi
 }
 
+# Dynamically checks the system for installed package managers
+get_available_managers() {
+    local managers=""
+    if command -v flatpak &> /dev/null; then managers+="flatpak\n"; fi
+    if command -v apt-get &> /dev/null; then managers+="apt\n"; fi
+    if command -v dnf &> /dev/null; then managers+="dnf\n"; fi
+    if command -v pacman &> /dev/null; then managers+="pacman\n"; fi
+    printf "%b" "$managers" | sed '/^$/d'
+}
+
 is_installed() {
     local pkg=$1
     local type=$2
@@ -391,7 +401,7 @@ manage_holds() {
 }
 
 downgrade_wizard() {
-    local PKG_TYPE=$(printf "flatpak\napt\ndnf\npacman" | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
+    local PKG_TYPE=$(get_available_managers | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
     if [ -z "$PKG_TYPE" ]; then return; fi
     
     local PKG_LIST=""
@@ -422,7 +432,7 @@ downgrade_wizard() {
 }
 
 create_hold_wizard() {
-    local PKG_TYPE=$(printf "flatpak\napt\ndnf\npacman" | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
+    local PKG_TYPE=$(get_available_managers | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
     if [ -z "$PKG_TYPE" ]; then return; fi
     
     local PKG_LIST=""
