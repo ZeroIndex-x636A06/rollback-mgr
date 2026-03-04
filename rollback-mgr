@@ -242,7 +242,9 @@ perform_downgrade() {
                     if [ -n "$selected_version" ]; then
                         local arch=$(dpkg --print-architecture)
                         echo "Finding compiled .deb hash for architecture: $arch..."
-                        local hash=$(curl -sL "https://snapshot.debian.org/mr/package/$pkg/$selected_version/binfiles?architecture=$arch" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d['result'][0]['hash'] if d.get('result') else '')" 2>/dev/null)
+                        
+                        # Python script explicitly looks for _amd64 (or whatever your architecture is) OR _all to prevent empty returns
+                        local hash=$(curl -sL "https://snapshot.debian.org/mr/package/$pkg/$selected_version/binfiles" | python3 -c "import sys, json; pkg=sys.argv[1]; arch=sys.argv[2]; d=json.load(sys.stdin); res=[x['hash'] for x in d.get('result', []) if x.get('name','').startswith(pkg+'_') and x.get('name','').endswith(('_'+arch+'.deb', '_all.deb'))]; print(res[0] if res else '')" "$pkg" "$arch" 2>/dev/null)
                         
                         if [ -z "$hash" ]; then
                             echo "Could not find a pre-compiled .deb for $arch."
@@ -289,7 +291,14 @@ perform_downgrade() {
 
 manage_holds() {
     while true; do
-        if [ ! -s "$HOLD_FILE" ]; then return; fi
+        if [ ! -s "$HOLD_FILE" ]; then 
+            clear
+            echo "=== Manage Active Holds ==="
+            echo "No holds are currently active."
+            echo ""
+            read -p "Press Enter to return to menu..."
+            return
+        fi
 
         local formatted_list=""
         while IFS='|' read -r pkg type exp_date; do
@@ -303,7 +312,14 @@ manage_holds() {
             fi
         done < "$HOLD_FILE"
 
-        if [ -z "$formatted_list" ]; then return; fi
+        if [ -z "$formatted_list" ]; then 
+            clear
+            echo "=== Manage Active Holds ==="
+            echo "No holds are currently active."
+            echo ""
+            read -p "Press Enter to return to menu..."
+            return
+        fi
 
         clear
         local selected=$(echo -e "$formatted_list" | column -t -s '|' | fzf --prompt="Select hold (Esc to exit) > " --height=15 --layout=reverse --header="PACKAGE  TYPE  EXPIRES")
@@ -496,7 +512,6 @@ check_holds() {
             update_cmd+="sudo dnf upgrade -y $dnf_pkgs; "
         fi
         
-        # Scrub ANY trailing semicolons or whitespace safely using printf
         update_cmd=$(printf "%s" "$update_cmd" | sed 's/[[:space:];]*$//')
         launch_terminal "$update_cmd"
     fi
