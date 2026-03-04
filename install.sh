@@ -32,3 +32,4 @@ echo "Configuring systemd background timers..."
 rollback-mgr check >/dev/null 2>&1
 
 echo "Installation complete."
+echo "You can now safely delete this folder. Just type 'rollback-mgr' from anywhere to launch the tool."
