@@ -9,7 +9,7 @@ DEFAULT_EXTEND_DAYS=7
 mkdir -p "$CONFIG_DIR"
 touch "$HOLD_FILE"
 
-# --- Automatic Background Setup (systemd) ---
+# --- Background Setup ---
 
 setup_systemd_timer() {
     local script_path=$(realpath "$0")
@@ -18,7 +18,6 @@ setup_systemd_timer() {
     local timer_file="$systemd_dir/rollback-mgr.timer"
 
     if [ ! -f "$timer_file" ]; then
-        echo "Setting up background daily checks via systemd..."
         mkdir -p "$systemd_dir"
 
         cat > "$service_file" <<EOF
@@ -46,8 +45,6 @@ EOF
 
         systemctl --user daemon-reload
         systemctl --user enable --now rollback-mgr.timer
-        echo "Background checks scheduled successfully."
-        sleep 1.5
     fi
 }
 
@@ -120,10 +117,10 @@ add_hold_entry() {
     echo "$pkg|$type|$exp_date" >> "$HOLD_FILE"
     
     apply_hold "$pkg" "$type"
-    echo "Successfully placed a hold on $pkg ($type) for $days days."
+    echo "Successfully placed hold on $pkg ($type) for $days days."
 }
 
-# --- Downgrade Function ---
+# --- Downgrade Logic ---
 
 perform_downgrade() {
     local pkg=$1
@@ -141,7 +138,6 @@ perform_downgrade() {
             if pacman -Qm | awk '{print $1}' | grep -qx "$pkg"; then
                 try_aur_fallback=true
             else
-                echo "Searching official archives and local cache for previous versions..."
                 if ! command -v downgrade &> /dev/null; then
                     sudo pacman -S --noconfirm downgrade
                 fi
@@ -151,8 +147,7 @@ perform_downgrade() {
                 if [ $? -eq 0 ]; then
                     return 0
                 else
-                    echo -e "\n The 'downgrade' utility could not find older versions or was cancelled."
-                    read -p "Would you like to try fetching an older version directly from the AUR instead? (y/N): " fallback_ans
+                    read -p "Official archive check failed. Try AUR commit history? (y/N): " fallback_ans
                     if [[ "$fallback_ans" =~ ^[Yy]$ ]]; then
                         try_aur_fallback=true
                     else
@@ -162,42 +157,28 @@ perform_downgrade() {
             fi
 
             if [ "$try_aur_fallback" = true ]; then
-                echo -e "\n Fetching commit history from the Arch User Repository (AUR)..."
-                
                 local orig_dir=$(pwd)
                 local temp_dir=$(mktemp -d)
                 cd "$temp_dir" || return 1
                 
                 if ! git clone "https://aur.archlinux.org/${pkg}.git" . &>/dev/null; then
-                    echo "Failed to clone AUR repository. This package might not exist on the AUR."
+                    echo "Failed to clone AUR repository."
                     cd "$orig_dir"
                     rm -rf "$temp_dir"
                     return 1
                 else
                     local commits=$(git log --pretty=format:"%h | %cd | %s" --date=short)
-                    local selected_commit=$(echo "$commits" | column -t -s '|' | fzf --prompt="Select AUR commit to build & install (Esc to skip) > " --height=15 --layout=reverse)
+                    local selected_commit=$(echo "$commits" | column -t -s '|' | fzf --prompt="Select AUR commit (Esc to cancel) > " --height=15 --layout=reverse)
                     
                     if [ -n "$selected_commit" ]; then
                         local hash=$(echo "$selected_commit" | awk '{print $1}')
-                        echo -e "\nChecking out commit $hash..."
                         git checkout "$hash" &>/dev/null
-                        
-                        echo "Building and installing $pkg from source..."
                         makepkg -si
                         
-                        if [ $? -eq 0 ]; then
-                            echo "AUR Downgrade complete."
-                            cd "$orig_dir"
-                            rm -rf "$temp_dir"
-                            return 0
-                        else
-                            echo "Build or installation failed."
-                            cd "$orig_dir"
-                            rm -rf "$temp_dir"
-                            return 1
-                        fi
+                        cd "$orig_dir"
+                        rm -rf "$temp_dir"
+                        return 0
                     else
-                        echo "AUR Downgrade skipped."
                         cd "$orig_dir"
                         rm -rf "$temp_dir"
                         return 1
@@ -211,61 +192,89 @@ perform_downgrade() {
             local remote=$(echo "$flatpak_info" | awk '{print $2}')
             local install_type=$(echo "$flatpak_info" | awk '{print $3}')
             
-            if [ -z "$remote" ]; then
-                echo "Could not determine remote for $pkg."
-                return 1
-            fi
-            
-            echo "Fetching commit history for $pkg from $remote ($install_type)..."
+            if [ -z "$remote" ]; then return 1; fi
             
             local raw_log=$(LC_ALL=C flatpak remote-info --log --${install_type} "$remote" "$pkg" 2>/dev/null)
-            
-            if [ -z "$raw_log" ]; then
-                echo "Failed to fetch commit history. The remote may be unreachable."
-                return 1
-            fi
+            if [ -z "$raw_log" ]; then return 1; fi
             
             local commits=$(echo "$raw_log" | awk '/^[ \t]*Commit:/ {c=$2} /^[ \t]*Date:/ {d=$0; sub(/^[ \t]*Date:[ \t]*/, "", d); print c " | " d}')
-            
-            local selected_commit=$(echo "$commits" | column -t -s '|' | fzf --prompt="Select commit to downgrade to (Esc to skip) > " --height=15 --layout=reverse)
+            local selected_commit=$(echo "$commits" | column -t -s '|' | fzf --prompt="Select commit (Esc to cancel) > " --height=15 --layout=reverse)
             
             if [ -n "$selected_commit" ]; then
                 local hash=$(echo "$selected_commit" | awk '{print $1}')
-                echo "Downgrading to commit $hash..."
-                
                 if [ "$install_type" == "system" ]; then
                     sudo flatpak update -y --system --commit="$hash" "$pkg"
                 else
                     flatpak update -y --user --commit="$hash" "$pkg"
                 fi
-                
-                if [ $? -eq 0 ]; then
-                    echo "Downgrade complete."
-                    return 0
-                else
-                    echo "Downgrade failed."
-                    return 1
-                fi
-            else
-                echo "Downgrade skipped."
-                return 1
-            fi
-            ;;
-            
-        apt)
-            local versions=$(apt-cache madison "$pkg" | awk '{print $3}')
-            local selected_version=$(echo "$versions" | fzf --prompt="Select version to downgrade to > " --height=10 --layout=reverse)
-            if [ -n "$selected_version" ]; then
-                sudo apt-get install -y "$pkg=$selected_version"
                 return $?
             else
                 return 1
             fi
             ;;
             
+        apt)
+            local versions=$(apt-cache madison "$pkg" | awk '{print $3}')
+            local version_count=$(echo "$versions" | wc -w)
+            
+            if [ "$version_count" -gt 1 ]; then
+                local selected_version=$(echo "$versions" | fzf --prompt="Select version (Esc to cancel) > " --height=10 --layout=reverse)
+                if [ -n "$selected_version" ]; then
+                    sudo apt-get install -y "$pkg=$selected_version"
+                    return $?
+                else
+                    return 1
+                fi
+            else
+                echo -e "Only one version found in local APT repositories."
+                read -p "Search the Debian Snapshot Archive (Historical Time Machine)? (y/N): " snap_ans
+                if [[ "$snap_ans" =~ ^[Yy]$ ]]; then
+                    echo "Querying Debian Snapshot API for $pkg..."
+                    local snap_versions=$(curl -sL "https://snapshot.debian.org/mr/package/$pkg/" | python3 -c "import sys, json; d=json.load(sys.stdin); print('\n'.join(x['version'] for x in d.get('result', [])))" 2>/dev/null)
+                    
+                    if [ -z "$snap_versions" ]; then
+                        echo "No historical versions found."
+                        return 1
+                    fi
+                    
+                    local selected_version=$(echo "$snap_versions" | fzf --prompt="Select historical version (Esc to cancel) > " --height=15 --layout=reverse)
+                    
+                    if [ -n "$selected_version" ]; then
+                        local arch=$(dpkg --print-architecture)
+                        echo "Finding compiled .deb hash for architecture: $arch..."
+                        local hash=$(curl -sL "https://snapshot.debian.org/mr/package/$pkg/$selected_version/binfiles?architecture=$arch" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d['result'][0]['hash'] if d.get('result') else '')" 2>/dev/null)
+                        
+                        if [ -z "$hash" ]; then
+                            echo "Could not find a pre-compiled .deb for $arch."
+                            return 1
+                        fi
+                        
+                        echo "Downloading package..."
+                        local tmp_deb="/tmp/${pkg}_${selected_version}.deb"
+                        wget -q --show-progress "https://snapshot.debian.org/file/$hash" -O "$tmp_deb"
+                        
+                        if [ -f "$tmp_deb" ]; then
+                            echo "Installing package..."
+                            sudo dpkg -i "$tmp_deb"
+                            local status=$?
+                            rm -f "$tmp_deb"
+                            return $status
+                        else
+                            echo "Download failed."
+                            return 1
+                        fi
+                    else
+                        return 1
+                    fi
+                else
+                    return 1
+                fi
+            fi
+            ;;
+            
         dnf)
             local versions=$(dnf --showduplicates list "$pkg" | awk 'NR>2 {print $2}')
-            local selected_version=$(echo "$versions" | fzf --prompt="Select version to downgrade to > " --height=10 --layout=reverse)
+            local selected_version=$(echo "$versions" | fzf --prompt="Select version (Esc to cancel) > " --height=10 --layout=reverse)
             if [ -n "$selected_version" ]; then
                 sudo dnf downgrade -y "$pkg-$selected_version"
                 return $?
@@ -276,18 +285,13 @@ perform_downgrade() {
     esac
 }
 
-# --- Management Menus ---
+# --- Menus ---
 
 manage_holds() {
     while true; do
-        if [ ! -s "$HOLD_FILE" ]; then
-            echo "There are no active holds tracked."
-            read -p "Press Enter to return to menu..."
-            return
-        fi
+        if [ ! -s "$HOLD_FILE" ]; then return; fi
 
         local formatted_list=""
-        
         while IFS='|' read -r pkg type exp_date; do
             if [ -n "$pkg" ]; then
                 if is_installed "$pkg" "$type"; then
@@ -299,71 +303,44 @@ manage_holds() {
             fi
         done < "$HOLD_FILE"
 
-        if [ -z "$formatted_list" ]; then
-            echo "There are no active holds."
-            read -p "Press Enter to return to menu..."
-            return
-        fi
+        if [ -z "$formatted_list" ]; then return; fi
 
         clear
-        local selected=$(echo -e "$formatted_list" | column -t -s '|' | fzf --prompt="Select a hold to manage (Esc to exit) > " --height=15 --layout=reverse --header="PACKAGE  TYPE  EXPIRES")
+        local selected=$(echo -e "$formatted_list" | column -t -s '|' | fzf --prompt="Select hold (Esc to exit) > " --height=15 --layout=reverse --header="PACKAGE  TYPE  EXPIRES")
 
-        if [ -z "$selected" ]; then
-            return
-        fi
+        if [ -z "$selected" ]; then return; fi
 
         local target_pkg=$(echo "$selected" | awk '{print $1}')
         local target_type=$(echo "$selected" | awk '{print $2}')
 
-        echo -e "\n--- Managing: $target_pkg ---"
-        local action=$(printf "1. Change hold duration\n2. Remove hold\n3. Cancel (Go back)" | fzf --prompt="Select action > " --height=6 --layout=reverse)
+        local action=$(printf "1. Change duration\n2. Remove hold\n3. Cancel" | fzf --prompt="Action for $target_pkg (Esc to cancel) > " --height=6 --layout=reverse)
 
         case "$action" in
-            "1. Change hold duration")
-                read -p "How many days from today do you want to hold '$target_pkg'? " new_days
+            "1. Change duration")
+                read -p "Enter new hold days: " new_days
                 if [[ "$new_days" =~ ^[0-9]+$ ]]; then
                     local new_exp=$(date -d "+$new_days days" +%s)
                     sed -i "/^$target_pkg|$target_type|/d" "$HOLD_FILE"
                     echo "$target_pkg|$target_type|$new_exp" >> "$HOLD_FILE"
-                    echo "Hold duration for $target_pkg updated to $new_days days."
-                else
-                    echo "Invalid input. Please enter a number."
                 fi
-                read -p "Press Enter to continue..."
                 ;;
-                
             "2. Remove hold")
-                echo ""
-                read -p "Are you sure you want to CANCEL the hold on '$target_pkg' and allow it to update? (y/n): " confirm
+                read -p "Remove hold on $target_pkg? (y/n): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
                     remove_hold "$target_pkg" "$target_type"
                     sed -i "/^$target_pkg|$target_type|/d" "$HOLD_FILE"
-                    echo "Hold successfully removed for $target_pkg."
-                else
-                    echo "No changes made."
                 fi
-                read -p "Press Enter to continue..."
                 ;;
-                
-            *)
-                continue
-                ;;
+            *) continue ;;
         esac
     done
 }
 
 downgrade_wizard() {
-    echo -e "\n--- Downgrade Package ---"
-    echo "Step 1: Select Package Manager"
-    local PKG_TYPE=$(printf "flatpak\napt\ndnf\npacman" | fzf --prompt="Select type (Type to filter) > " --height=10 --layout=reverse)
+    local PKG_TYPE=$(printf "flatpak\napt\ndnf\npacman" | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
+    if [ -z "$PKG_TYPE" ]; then return; fi
     
-    if [ -z "$PKG_TYPE" ]; then
-        return
-    fi
-    
-    echo -e "\nStep 2: Fetching installed packages for $PKG_TYPE..."
     local PKG_LIST=""
-    
     case $PKG_TYPE in
         flatpak) PKG_LIST=$(flatpak list --columns=application) ;;
         apt) PKG_LIST=$(dpkg-query -f '${Package}\n' -W) ;;
@@ -371,23 +348,19 @@ downgrade_wizard() {
         pacman) PKG_LIST=$(pacman -Qq) ;;
     esac
     
-    local TARGET_PKG=$(echo "$PKG_LIST" | fzf --prompt="Search package to downgrade > " --height=15 --layout=reverse --info=inline)
-    
-    if [ -z "$TARGET_PKG" ]; then
-        return
-    fi
+    local TARGET_PKG=$(echo "$PKG_LIST" | fzf --prompt="Select package (Esc to cancel) > " --height=15 --layout=reverse)
+    if [ -z "$TARGET_PKG" ]; then return; fi
     
     perform_downgrade "$TARGET_PKG" "$PKG_TYPE"
-    local downgrade_status=$?
-    
-    if [ $downgrade_status -eq 0 ]; then
-        echo -e "\n--- Hold Package ---"
-        read -p "Would you like to place a hold on '$TARGET_PKG' to prevent it from updating again? (y/N): " hold_ans
+    if [ $? -eq 0 ]; then
+        echo ""
+        read -p "Place hold on $TARGET_PKG? (y/N): " hold_ans
         if [[ "$hold_ans" =~ ^[Yy]$ ]]; then
-            read -p "How many days do you want to hold '$TARGET_PKG'? [Default: 7]: " HOLD_DAYS
-            HOLD_DAYS=${HOLD_DAYS:-7} 
-            add_hold_entry "$TARGET_PKG" "$PKG_TYPE" "$HOLD_DAYS"
+            read -p "Days to hold [Default: 7]: " HOLD_DAYS
+            add_hold_entry "$TARGET_PKG" "$PKG_TYPE" "${HOLD_DAYS:-7}"
         fi
+    else
+        echo -e "\nDowngrade cancelled or failed."
     fi
     
     echo ""
@@ -395,16 +368,10 @@ downgrade_wizard() {
 }
 
 create_hold_wizard() {
-    echo -e "\nStep 1: Select Package Manager"
-    local PKG_TYPE=$(printf "flatpak\napt\ndnf\npacman" | fzf --prompt="Select type (Type to filter) > " --height=10 --layout=reverse)
+    local PKG_TYPE=$(printf "flatpak\napt\ndnf\npacman" | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
+    if [ -z "$PKG_TYPE" ]; then return; fi
     
-    if [ -z "$PKG_TYPE" ]; then
-        return
-    fi
-    
-    echo -e "\nStep 2: Fetching installed packages for $PKG_TYPE..."
     local PKG_LIST=""
-    
     case $PKG_TYPE in
         flatpak) PKG_LIST=$(flatpak list --columns=application) ;;
         apt) PKG_LIST=$(dpkg-query -f '${Package}\n' -W) ;;
@@ -412,51 +379,17 @@ create_hold_wizard() {
         pacman) PKG_LIST=$(pacman -Qq) ;;
     esac
     
-    local TARGET_PKG=$(echo "$PKG_LIST" | fzf --prompt="Search package to hold > " --height=15 --layout=reverse --info=inline)
+    local TARGET_PKG=$(echo "$PKG_LIST" | fzf --prompt="Select package (Esc to cancel) > " --height=15 --layout=reverse)
+    if [ -z "$TARGET_PKG" ]; then return; fi
     
-    if [ -z "$TARGET_PKG" ]; then
-        return
-    fi
+    read -p "Days to hold [Default: 7]: " HOLD_DAYS
+    add_hold_entry "$TARGET_PKG" "$PKG_TYPE" "${HOLD_DAYS:-7}"
     
-    echo -e "\nStep 3: Hold Duration"
-    read -p "How many days do you want to hold '$TARGET_PKG'? [Default: 7]: " HOLD_DAYS
-    HOLD_DAYS=${HOLD_DAYS:-7} 
-    
-    echo -e "\n--- Summary ---"
-    echo "Package: $TARGET_PKG"
-    echo "Type:    $PKG_TYPE"
-    echo "Hold:    $HOLD_DAYS days"
-    echo "---------------"
-    read -p "Apply this hold? (y/n): " CONFIRM
-    
-    if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-        add_hold_entry "$TARGET_PKG" "$PKG_TYPE" "$HOLD_DAYS"
-    else
-        echo "Cancelled."
-    fi
-    read -p "Press Enter to continue..."
+    echo ""
+    read -p "Press Enter to return to menu..."
 }
 
-main_menu() {
-    setup_systemd_timer
-    
-    while true; do
-        clear
-        echo "=== Rollback Manager Menu ==="
-        echo ""
-        
-        local action=$(printf "1. Create a new hold\n2. Manage active holds\n3. Downgrade a package\n4. Exit" | fzf --prompt="Select action > " --height=8 --layout=reverse)
-
-        case "$action" in
-            "1. Create a new hold") create_hold_wizard ;;
-            "2. Manage active holds") manage_holds ;;
-            "3. Downgrade a package") downgrade_wizard ;;
-            *) echo "Exiting."; exit 0 ;;
-        esac
-    done
-}
-
-# --- Background Check Function (For Systemd) ---
+# --- Background Check ---
 
 check_holds() {
     export XDG_RUNTIME_DIR="/run/user/$(id -u)"
@@ -466,18 +399,11 @@ check_holds() {
 
     local current_date=$(date +%s)
     local temp_file=$(mktemp)
-    
-    local expired_pkgs=()
-    local expired_types=()
-    local expired_exps=()
-    local expired_count=0
+    local expired_pkgs=() expired_types=() expired_exps=() expired_count=0
     
     while IFS='|' read -r pkg type exp_date; do
         if [ -z "$pkg" ]; then continue; fi
-        
-        if ! is_installed "$pkg" "$type"; then
-            continue
-        fi
+        if ! is_installed "$pkg" "$type"; then continue; fi
 
         if [ "$current_date" -ge "$exp_date" ]; then
             expired_pkgs+=("$pkg")
@@ -496,12 +422,9 @@ check_holds() {
     
     local user_action=""
     if command -v notify-send &> /dev/null; then
-        user_action=$(notify-send -a "Rollback Manager" -i system-software-update \
-            "Update Holds Expired" \
+        user_action=$(notify-send -a "Rollback Manager" "Update Holds Expired" \
             "$expired_count package(s) have reached the end of their hold period." \
-            --action="default=Review Holds" \
-            --action="review=Review Holds" \
-            --wait 2>/dev/null)
+            --action="default=Review Holds" --action="review=Review Holds" --wait 2>/dev/null)
     else
         user_action="review"
     fi
@@ -514,57 +437,35 @@ check_holds() {
         return 
     fi
     
-    local pacman_pkgs=""
-    local flatpak_pkgs=""
-    local apt_pkgs=""
-    local dnf_pkgs=""
+    local pacman_pkgs="" flatpak_pkgs="" apt_pkgs="" dnf_pkgs=""
     
     for i in "${!expired_pkgs[@]}"; do
         local p="${expired_pkgs[$i]}"
         local t="${expired_types[$i]}"
-        local current_num=$((i + 1))
-        
         while true; do
-            zenity --question \
-                   --title="Hold Expired ($current_num of $expired_count)" \
-                   --text="The hold period for <b>$p</b> ($t) has ended.\n\nDo you want to unhold and update this package, or continue holding it?" \
-                   --ok-label="Unhold & Update" \
-                   --cancel-label="Hold longer" 2>/dev/null
+            zenity --question --title="Hold Expired ($((i+1)) of $expired_count)" \
+                   --text="Hold for $p ($t) has ended. Unhold and update?" \
+                   --ok-label="Unhold & Update" --cancel-label="Hold longer" 2>/dev/null
             
             if [ $? -eq 0 ]; then
-                # --- QUEUE FOR UNHOLD AND UPDATE ---
-                # We temporarily save it back to temp_file. 
-                # The terminal command will delete it later ONLY if the sudo unhold actually succeeds!
                 echo "$p|$t|${expired_exps[$i]}" >> "$temp_file"
-                
                 case $t in
-                    pacman) pacman_pkgs="$pacman_pkgs $p" ;;
-                    flatpak) flatpak_pkgs="$flatpak_pkgs $p" ;;
-                    apt) apt_pkgs="$apt_pkgs $p" ;;
-                    dnf) dnf_pkgs="$dnf_pkgs $p" ;;
+                    pacman) pacman_pkgs+="$p " ;;
+                    flatpak) flatpak_pkgs+="$p " ;;
+                    apt) apt_pkgs+="$p " ;;
+                    dnf) dnf_pkgs+="$p " ;;
                 esac
                 break 
             else
-                # --- EXTEND HOLD ---
-                local extend_days=$(zenity --entry \
-                    --title="Extend Hold ($current_num of $expired_count)" \
-                    --text="How many days do you want to continue holding $p?\n(Leave blank for default: $DEFAULT_EXTEND_DAYS)" \
+                local extend_days=$(zenity --entry --title="Extend Hold" \
+                    --text="Days to hold $p? (Blank for default: $DEFAULT_EXTEND_DAYS)" \
                     --entry-text="$DEFAULT_EXTEND_DAYS" 2>/dev/null)
                 
-                local entry_status=$?
-                
-                if [ $entry_status -eq 0 ]; then
-                    if [ -z "$extend_days" ]; then
-                        extend_days=$DEFAULT_EXTEND_DAYS
-                    fi
-                    
-                    if [[ "$extend_days" =~ ^[0-9]+$ ]]; then
-                        local new_exp=$(date -d "+$extend_days days" +%s)
-                        echo "$p|$t|$new_exp" >> "$temp_file"
+                if [ $? -eq 0 ]; then
+                    local days=${extend_days:-$DEFAULT_EXTEND_DAYS}
+                    if [[ "$days" =~ ^[0-9]+$ ]]; then
+                        echo "$p|$t|$(date -d "+$days days" +%s)" >> "$temp_file"
                         break 
-                    else
-                        zenity --error --text="Please enter a valid number of days." 2>/dev/null
-                        continue 
                     fi
                 else
                     continue
@@ -575,51 +476,46 @@ check_holds() {
     
     mv "$temp_file" "$HOLD_FILE"
     
-    # Build the massive secure payload to run entirely in the terminal
     local update_cmd=""
-    
-    if [ -n "$pacman_pkgs" ] || [ -n "$flatpak_pkgs" ] || [ -n "$apt_pkgs" ] || [ -n "$dnf_pkgs" ]; then
-        update_cmd="echo -e '\n Rollback Manager requires root access to process updates.\n'; sudo -v; echo ''; "
-    fi
-    
-    if [ -n "$pacman_pkgs" ]; then
-        for p in $pacman_pkgs; do
-            update_cmd+="sudo bash -c \"sed -i 's/[[:space:]]*\\\\b${p}\\\\b//g' /etc/pacman.conf\" && sed -i \"/^${p}|pacman|/d\" \"$HOLD_FILE\" ; "
-        done
-        update_cmd+="sudo pacman -S $pacman_pkgs ; "
-    fi
-    
-    if [ -n "$flatpak_pkgs" ]; then
-        for p in $flatpak_pkgs; do
-            update_cmd+="sudo flatpak mask --remove ${p} >/dev/null 2>&1 && sed -i \"/^${p}|flatpak|/d\" \"$HOLD_FILE\" ; "
-        done
-        update_cmd+="sudo flatpak update -y $flatpak_pkgs ; "
-    fi
-    
-    if [ -n "$apt_pkgs" ]; then
-        for p in $apt_pkgs; do
-            update_cmd+="sudo apt-mark unhold ${p} >/dev/null 2>&1 && sed -i \"/^${p}|apt|/d\" \"$HOLD_FILE\" ; "
-        done
-        update_cmd+="sudo apt-get --only-upgrade install -y $apt_pkgs ; "
-    fi
-    
-    if [ -n "$dnf_pkgs" ]; then
-        for p in $dnf_pkgs; do
-            update_cmd+="sudo dnf versionlock delete ${p} >/dev/null 2>&1 && sed -i \"/^${p}|dnf|/d\" \"$HOLD_FILE\" ; "
-        done
-        update_cmd+="sudo dnf upgrade -y $dnf_pkgs ; "
-    fi
-    
-    if [ -n "$update_cmd" ]; then
-        update_cmd=$(echo "$update_cmd" | sed 's/[ ;]*$//')
+    if [ -n "$pacman_pkgs$flatpak_pkgs$apt_pkgs$dnf_pkgs" ]; then
+        update_cmd="echo 'Authenticating...'; sudo -v; "
+        if [ -n "$pacman_pkgs" ]; then
+            for p in $pacman_pkgs; do update_cmd+="sudo bash -c \"sed -i 's/[[:space:]]*\\\\b${p}\\\\b//g' /etc/pacman.conf\" && sed -i \"/^${p}|pacman|/d\" \"$HOLD_FILE\" ; "; done
+            update_cmd+="sudo pacman -S $pacman_pkgs; "
+        fi
+        if [ -n "$flatpak_pkgs" ]; then
+            for p in $flatpak_pkgs; do update_cmd+="sudo flatpak mask --remove ${p} >/dev/null 2>&1 && sed -i \"/^${p}|flatpak|/d\" \"$HOLD_FILE\" ; "; done
+            update_cmd+="sudo flatpak update -y $flatpak_pkgs; "
+        fi
+        if [ -n "$apt_pkgs" ]; then
+            for p in $apt_pkgs; do update_cmd+="sudo apt-mark unhold ${p} >/dev/null 2>&1 && sed -i \"/^${p}|apt|/d\" \"$HOLD_FILE\" ; "; done
+            update_cmd+="sudo apt-get --only-upgrade install -y $apt_pkgs; "
+        fi
+        if [ -n "$dnf_pkgs" ]; then
+            for p in $dnf_pkgs; do update_cmd+="sudo dnf versionlock delete ${p} >/dev/null 2>&1 && sed -i \"/^${p}|dnf|/d\" \"$HOLD_FILE\" ; "; done
+            update_cmd+="sudo dnf upgrade -y $dnf_pkgs; "
+        fi
+        
+        # Scrub ANY trailing semicolons or whitespace safely using printf
+        update_cmd=$(printf "%s" "$update_cmd" | sed 's/[[:space:];]*$//')
         launch_terminal "$update_cmd"
     fi
 }
 
-# --- Main Execution ---
+# --- Execution ---
 
 if [ "$1" == "check" ]; then
     check_holds
 else
-    main_menu
+    setup_systemd_timer
+    while true; do
+        clear
+        action=$(printf "1. Create new hold\n2. Manage active holds\n3. Downgrade package\n4. Exit" | fzf --prompt="Select action (Esc to cancel) > " --height=8 --layout=reverse)
+        case "$action" in
+            "1. Create new hold") create_hold_wizard ;;
+            "2. Manage active holds") manage_holds ;;
+            "3. Downgrade package") downgrade_wizard ;;
+            *) exit 0 ;;
+        esac
+    done
 fi
