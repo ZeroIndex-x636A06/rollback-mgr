@@ -153,7 +153,8 @@ perform_downgrade() {
                 fi
                 
                 # Note: The 'downgrade' utility automatically tags the installed version natively!
-                sudo downgrade "$pkg"
+                # We use --ignore=never to suppress its built-in hold prompt so our timed hold takes over.
+                sudo downgrade --ignore=never "$pkg"
                 
                 if [ $? -eq 0 ]; then
                     return 0
