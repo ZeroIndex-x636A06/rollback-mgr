@@ -1,0 +1,118 @@
+# Weekly-audit harness: installs and runs rollback-mgr the way the README
+# says, on a real systemd VM plus clean distro containers. Triggered by the
+# weekly Claude routine (workflow_dispatch) or by edits to this file.
+name: audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/audit.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # secret scan covers full history
+      - id: syntax
+        continue-on-error: true
+        run: for f in rollback-mgr install.sh uninstall.sh; do bash -n "$f"; done
+      - id: shellcheck_errors
+        continue-on-error: true
+        run: shellcheck -S error rollback-mgr install.sh uninstall.sh
+      - name: shellcheck (all, informational)
+        run: shellcheck rollback-mgr install.sh uninstall.sh || true
+      - id: secret_scan
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
+
+  # Real Ubuntu VM: systemd, sudo, user session — the README's full flow.
+  install-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rollback mgr src   # path with spaces on purpose
+      - name: start a user systemd instance (README promises a timer)
+        run: |
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          for i in $(seq 1 20); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+      - id: install
+        continue-on-error: true
+        working-directory: rollback mgr src
+        run: chmod +x install.sh && ./install.sh
+      - id: binary_installed
+        continue-on-error: true
+        run: test -x /usr/local/bin/rollback-mgr
+      - id: fzf_installed
+        continue-on-error: true
+        run: command -v fzf
+      - id: check_runs
+        continue-on-error: true
+        run: rollback-mgr check
+      - id: timer_installed  # README: "the background timer will check for expired holds daily"
+        continue-on-error: true
+        run: systemctl --user list-timers --all --no-pager | tee /dev/stderr | grep -i rollback
+      - id: help_flag
+        continue-on-error: true
+        run: rollback-mgr --help
+      - id: uninstall
+        continue-on-error: true
+        working-directory: rollback mgr src
+        run: chmod +x uninstall.sh && echo y | ./uninstall.sh
+      - id: uninstall_clean
+        continue-on-error: true
+        run: test ! -e /usr/local/bin/rollback-mgr
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
+
+  # Installer package-manager branches on the other supported distros.
+  install-distros:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['archlinux:latest', 'fedora:latest', 'debian:stable']
+    container: ${{ matrix.image }}
+    steps:
+      - name: bootstrap sudo (containers run as root without it)
+        run: |
+          if command -v pacman >/dev/null; then pacman -Sy --noconfirm sudo git jq
+          elif command -v dnf >/dev/null; then dnf install -y sudo git jq
+          else apt-get update && apt-get install -y sudo git jq; fi
+      - uses: actions/checkout@v4
+      - id: install
+        continue-on-error: true
+        run: ./install.sh
+      - id: fzf_installed
+        continue-on-error: true
+        run: command -v fzf
+      - id: check_runs
+        continue-on-error: true
+        run: rollback-mgr check
+      - name: summary
+        if: always()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
