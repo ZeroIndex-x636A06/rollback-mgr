@@ -15,7 +15,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0   # secret scan covers full history
       - id: syntax
@@ -36,14 +36,14 @@ jobs:
         env:
           STEPS: ${{ toJSON(steps) }}
         run: |
-          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$STEPS" | jq -r 'to_entries[] | select(.key|test("^[0-9a-f]{32}$")|not) | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
           ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
 
   # Real Ubuntu VM: systemd, sudo, user session — the README's full flow.
   install-ubuntu:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: rollback mgr src   # path with spaces on purpose
       - name: start a user systemd instance (README promises a timer)
@@ -67,6 +67,16 @@ jobs:
       - id: timer_installed  # README: "the background timer will check for expired holds daily"
         continue-on-error: true
         run: systemctl --user list-timers --all --no-pager | tee /dev/stderr | grep -i rollback
+      # README lists zenity/libnotify as dependencies but install.sh only
+      # installs fzf; re-check with them present to separate the two failures.
+      - name: install the README's other dependencies
+        run: sudo apt-get install -y zenity libnotify-bin >/dev/null
+      - id: check_runs_with_deps
+        continue-on-error: true
+        run: rollback-mgr check
+      - id: timer_installed_with_deps
+        continue-on-error: true
+        run: systemctl --user list-timers --all --no-pager | tee /dev/stderr | grep -i rollback
       - id: help_flag
         continue-on-error: true
         run: rollback-mgr --help
@@ -82,7 +92,7 @@ jobs:
         env:
           STEPS: ${{ toJSON(steps) }}
         run: |
-          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$STEPS" | jq -r 'to_entries[] | select(.key|test("^[0-9a-f]{32}$")|not) | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
           ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
 
   # Installer package-manager branches on the other supported distros.
@@ -99,10 +109,10 @@ jobs:
           if command -v pacman >/dev/null; then pacman -Sy --noconfirm sudo git jq
           elif command -v dnf >/dev/null; then dnf install -y sudo git jq
           else apt-get update && apt-get install -y sudo git jq; fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: install
         continue-on-error: true
-        run: ./install.sh
+        run: chmod +x install.sh && ./install.sh
       - id: fzf_installed
         continue-on-error: true
         run: command -v fzf
@@ -114,5 +124,5 @@ jobs:
         env:
           STEPS: ${{ toJSON(steps) }}
         run: |
-          echo "$STEPS" | jq -r 'to_entries[] | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$STEPS" | jq -r 'to_entries[] | select(.key|test("^[0-9a-f]{32}$")|not) | "AUDIT \(.key): \(.value.outcome)"' | tee -a "$GITHUB_STEP_SUMMARY"
           ! echo "$STEPS" | jq -e 'to_entries[] | select(.value.outcome=="failure")' >/dev/null
