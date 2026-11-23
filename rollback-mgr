@@ -220,8 +220,28 @@ perform_downgrade() {
     
     echo -e "\n--- Downgrading $pkg ---"
     
+    # Remember any existing hold so it can be restored if the downgrade fails or is cancelled
+    local prev_entry
+    prev_entry=$(grep "^$pkg|$type|" "$HOLD_FILE")
+    
     sed -i "/^$pkg|$type|/d" "$HOLD_FILE"
     remove_hold "$pkg" "$type"
+    
+    run_downgrade "$pkg" "$type"
+    local status=$?
+    
+    if [ $status -ne 0 ] && [ -n "$prev_entry" ]; then
+        echo "$prev_entry" >> "$HOLD_FILE"
+        apply_hold "$pkg" "$type"
+        echo "Hold on $pkg ($type) restored."
+    fi
+    
+    return $status
+}
+
+run_downgrade() {
+    local pkg=$1
+    local type=$2
     
     case $type in
         pacman)
@@ -353,7 +373,7 @@ perform_downgrade() {
                 local selected_version=$(echo "$selected" | awk '{print $1}')
                 
                 if [ -n "$selected_version" ]; then
-                    sudo apt-get install -y "$pkg=$selected_version"
+                    sudo apt-get install -y --allow-downgrades "$pkg=$selected_version"
                     return $?
                 else
                     return 1
