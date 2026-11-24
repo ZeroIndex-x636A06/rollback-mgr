@@ -5,19 +5,41 @@ CONFIG_DIR="$HOME/.config/rollback-mgr"
 HOLD_FILE="$CONFIG_DIR/holds.txt"
 DEFAULT_EXTEND_DAYS=7
 
+# Where older pacman packages are looked up (overridable, mainly for tests)
+ALA_URL="${ROLLBACK_MGR_ALA_URL:-https://archive.archlinux.org/packages}"
+CACHYOS_ARCHIVE_URL="${ROLLBACK_MGR_CACHYOS_ARCHIVE_URL:-https://archive.cachyos.org}"
+# Extra flags for linked-set transactions (the tests pass --noconfirm here)
+TXN_FLAGS="${ROLLBACK_MGR_TXN_FLAGS:-}"
+# A linked set larger than this stops growing and the user is warned
+LINKED_SET_CAP="${ROLLBACK_MGR_SET_CAP:-40}"
+
 # Ensure config directory and file exist
 mkdir -p "$CONFIG_DIR"
 touch "$HOLD_FILE"
+RM_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/rollback-mgr.XXXXXX")
 
 # --- Global Flags ---
 
 VERBOSE=false
-while [[ "$1" == -* ]]; do
-    case "$1" in
-        -v|--verbose) VERBOSE=true; shift ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
-    esac
-done
+
+usage() {
+    cat <<EOF
+Usage: rollback-mgr [-v|--verbose]                 Open the interactive manager
+       rollback-mgr check                          Review expired holds (run daily by the timer)
+       rollback-mgr linked <manager> <package>     Show the packages that must roll back with <package>
+                                                   (read-only; manager is pacman, apt or dnf)
+EOF
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    while [[ "$1" == -* ]]; do
+        case "$1" in
+            -v|--verbose) VERBOSE=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "Unknown option: $1"; usage; exit 1 ;;
+        esac
+    done
+fi
 
 if [ "$VERBOSE" = true ]; then
     REDIRECT=""
@@ -31,6 +53,10 @@ exec_quiet() {
     else
         "$@" >/dev/null 2>&1
     fi
+}
+
+cleanup_tmp() {
+    if [ -n "$RM_TMPDIR" ] && [ -d "$RM_TMPDIR" ]; then rm -rf "$RM_TMPDIR"; fi
 }
 
 # --- Background Setup ---
@@ -74,7 +100,7 @@ EOF
 
 start_spinner() {
     local message="$1"
-    if [ "$VERBOSE" = true ]; then
+    if [ "$VERBOSE" = true ] || [ ! -t 1 ]; then
         echo -e "\n>>> $message"
         return
     fi
@@ -89,12 +115,10 @@ start_spinner() {
 }
 
 stop_spinner() {
-    if [ "$VERBOSE" = true ]; then return; fi
-    if [ -n "$SPINNER_PID" ]; then
-        kill $SPINNER_PID &>/dev/null
-        wait $SPINNER_PID 2>/dev/null
-        unset SPINNER_PID
-    fi
+    if [ "$VERBOSE" = true ] || [ -z "$SPINNER_PID" ]; then return; fi
+    kill $SPINNER_PID &>/dev/null
+    wait $SPINNER_PID 2>/dev/null
+    unset SPINNER_PID
     echo -ne "\r\033[K" # Clear the line
     tput cnorm         # Restore the cursor
 }
@@ -125,78 +149,185 @@ get_available_managers() {
     printf "%b" "$managers" | sed '/^$/d'
 }
 
+list_installed() {
+    case $1 in
+        flatpak) flatpak list --columns=application | sort | uniq ;;
+        apt) dpkg-query -f '${binary:Package}\n' -W ;;
+        dnf) dnf list --installed 2>/dev/null | awk 'NF >= 3 && $1 ~ /\./ {print $1}' ;;
+        pacman) pacman -Qq ;;
+    esac
+}
+
 is_installed() {
     local pkg=$1
     local type=$2
     case $type in
         flatpak|flatpak-user|flatpak-system) flatpak info "$pkg" &>/dev/null ;;
         apt) dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed" ;;
-        dnf) dnf list installed "$pkg" &>/dev/null ;;
+        dnf) rpm -q "$pkg" &>/dev/null ;;
         pacman) pacman -Qq "$pkg" &>/dev/null ;;
+    esac
+}
+
+# --- pacman IgnorePkg editing ---
+# Package names are matched as whole tokens on IgnorePkg lines in [options] only
+# (pacman.conf has no inline comments, so every word after "=" is a package).
+# (A word-boundary match treats "-" as a boundary, so holding lib32-nvidia-utils
+# used to make nvidia-utils look held, and unholding nvidia-utils cut
+# lib32-nvidia-utils down to "lib32-".)
+
+pacman_ignore_edit() {
+    local mode=$1; shift
+    local conf=/etc/pacman.conf tmp
+    tmp=$(mktemp)
+    awk -v mode="$mode" -v list="$*" '
+        { line[NR] = $0 }
+        END {
+            n = split(list, want, " ")
+            sec = ""; first = 0; commented = 0; opts = 0
+            for (i = 1; i <= NR; i++) {
+                l = line[i]
+                if (l ~ /^[ \t]*\[.*\]/) {
+                    s = l; sub(/^[ \t]*\[/, "", s); sub(/\].*$/, "", s); sec = s
+                    if (sec == "options" && !opts) opts = i
+                    continue
+                }
+                if (sec != "options") continue
+                if (l ~ /^[ \t]*IgnorePkg[ \t]*=/) {
+                    if (!first) first = i
+                    active[i] = 1
+                    v = l; sub(/^[^=]*=/, "", v)
+                    m = split(v, tok, /[ \t]+/)
+                    for (j = 1; j <= m; j++) if (tok[j] != "") have[tok[j]] = 1
+                } else if (l ~ /^[ \t]*#[ \t]*IgnorePkg[ \t]*=/ && !commented) {
+                    commented = i
+                }
+            }
+            if (mode == "add") {
+                add = ""
+                for (k = 1; k <= n; k++)
+                    if (want[k] != "" && !(want[k] in have) && !(want[k] in seen)) { add = add " " want[k]; seen[want[k]] = 1 }
+                if (add != "") {
+                    if (first) { l = line[first]; sub(/[ \t]+$/, "", l); line[first] = l add }
+                    else if (commented) line[commented] = line[commented] "\nIgnorePkg   =" add
+                    else if (opts) line[opts] = line[opts] "\nIgnorePkg   =" add
+                }
+            } else {
+                for (k = 1; k <= n; k++) drop[want[k]] = 1
+                for (i in active) {
+                    l = line[i]; key = l; sub(/=.*/, "=", key)
+                    v = l; sub(/^[^=]*=/, "", v)
+                    m = split(v, tok, /[ \t]+/); out = ""; hit = 0
+                    for (j = 1; j <= m; j++) {
+                        if (tok[j] == "") continue
+                        if (tok[j] in drop) hit = 1; else out = out " " tok[j]
+                    }
+                    if (hit) line[i] = key out
+                }
+            }
+            for (i = 1; i <= NR; i++) print line[i]
+        }' "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    # cp onto the existing file keeps its owner and permissions
+    if [ "$(md5sum < "$tmp")" != "$(md5sum < "$conf")" ]; then exec_quiet sudo cp "$tmp" "$conf"; fi
+    rm -f "$tmp"
+}
+
+# Is the package held by the package manager itself (whoever set the hold)?
+is_held_system() {
+    local pkg=$1
+    case $2 in
+        pacman) pacman-conf IgnorePkg 2>/dev/null | tr ' ' '\n' | grep -qxF -- "$pkg" ;;
+        apt) apt-mark showhold 2>/dev/null | grep -qxF -- "$pkg" ;;
+        *) return 1 ;;
     esac
 }
 
 apply_hold() {
     local pkg=$1
     local type=$2
-    
+
     case $type in
         flatpak-user) exec_quiet flatpak mask --user "$pkg" ;;
         flatpak-system) exec_quiet sudo flatpak mask --system "$pkg" ;;
         flatpak) # Legacy fallback
-            if flatpak list --columns=application,installation | grep -E "^$pkg[[:space:]]" | grep -q "user"; then exec_quiet flatpak mask --user "$pkg"; fi
-            if flatpak list --columns=application,installation | grep -E "^$pkg[[:space:]]" | grep -q "system"; then exec_quiet sudo flatpak mask --system "$pkg"; fi
+            if flatpak list --columns=application,installation | grep -E "^${pkg}[[:space:]]" | grep -q "user"; then exec_quiet flatpak mask --user "$pkg"; fi
+            if flatpak list --columns=application,installation | grep -E "^${pkg}[[:space:]]" | grep -q "system"; then exec_quiet sudo flatpak mask --system "$pkg"; fi
             ;;
         apt) exec_quiet sudo apt-mark hold "$pkg" ;;
-        dnf) 
+        dnf)
             if ! dnf versionlock --help >/dev/null 2>&1; then exec_quiet sudo dnf install -y 'dnf-command(versionlock)'; fi
-            exec_quiet sudo dnf versionlock add "$pkg" ;;
-        pacman) 
-            exec_quiet sudo bash -c '
-                if ! grep -q "^#\?[[:space:]]*IgnorePkg" /etc/pacman.conf; then sed -i "/^\[options\]/a IgnorePkg = '"$1"'" /etc/pacman.conf
-                else sed -i "s/^#[[:space:]]*IgnorePkg/IgnorePkg/" /etc/pacman.conf; if ! grep -q "^IgnorePkg.*\\b'"$1"'\\b" /etc/pacman.conf; then sed -i "/^IgnorePkg/ s/$/ '"$1"'/" /etc/pacman.conf; fi; fi' ;;
+            exec_quiet sudo dnf versionlock add "$(dnf_lock_name "$pkg")" ;;
+        pacman) pacman_ignore_edit add "$pkg" ;;
     esac
 }
 
 remove_hold() {
     local pkg=$1
     local type=$2
-    
+
     case $type in
         flatpak-user) exec_quiet flatpak mask --remove --user "$pkg" ;;
         flatpak-system) exec_quiet sudo flatpak mask --remove --system "$pkg" ;;
         flatpak) # Legacy fallback
-            if flatpak list --columns=application,installation | grep -E "^$pkg[[:space:]]" | grep -q "user"; then exec_quiet flatpak mask --remove --user "$pkg"; fi
-            if flatpak list --columns=application,installation | grep -E "^$pkg[[:space:]]" | grep -q "system"; then exec_quiet sudo flatpak mask --remove --system "$pkg"; fi
+            if flatpak list --columns=application,installation | grep -E "^${pkg}[[:space:]]" | grep -q "user"; then exec_quiet flatpak mask --remove --user "$pkg"; fi
+            if flatpak list --columns=application,installation | grep -E "^${pkg}[[:space:]]" | grep -q "system"; then exec_quiet sudo flatpak mask --remove --system "$pkg"; fi
             ;;
         apt) exec_quiet sudo apt-mark unhold "$pkg" ;;
-        dnf) exec_quiet sudo dnf versionlock delete "$pkg" ;;
-        pacman) exec_quiet sudo bash -c "sed -i 's/[[:space:]]*\b$pkg\b//g' /etc/pacman.conf" ;;
+        dnf) exec_quiet sudo dnf versionlock delete "$(dnf_lock_name "$pkg")" ;;
+        pacman) pacman_ignore_edit remove "$pkg" ;;
     esac
+}
+
+# versionlock works on package names: "delete name.arch" silently does nothing in dnf5
+dnf_lock_name() {
+    case ${1##*.} in
+        x86_64|i686|i386|noarch|aarch64|ppc64le|s390x|armv7hl|riscv64) echo "${1%.*}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# --- Hold file ---
+# One line per hold: package|type|expiry[|set]
+# "set" names the linked set the hold belongs to (its primary package), so the
+# whole set expires, extends and unholds together.
+
+hold_line() { grep -m1 "^$1|$2|" "$HOLD_FILE"; }
+
+hold_set_members() { # set type -> member packages
+    awk -F'|' -v s="$1" -v t="$2" '$4 == s && $2 == t {print $1}' "$HOLD_FILE"
+}
+
+write_hold_line() { # pkg type exp [set]
+    sed -i "/^$1|$2|/d" "$HOLD_FILE"
+    if [ -n "$4" ]; then
+        echo "$1|$2|$3|$4" >> "$HOLD_FILE"
+    else
+        echo "$1|$2|$3" >> "$HOLD_FILE"
+    fi
 }
 
 add_hold_entry() {
     local pkg=$1
     local type=$2
     local days=$3
-    
+    local set=$4
+
     local exp_date
     if [ "$days" -eq 0 ]; then
         exp_date=0
     else
         exp_date=$(date -d "+$days days" +%s)
     fi
-    
+
     local already_held=false
     if grep -q "^$pkg|$type|" "$HOLD_FILE"; then
         already_held=true
     fi
-    
-    sed -i "/^$pkg|$type|/d" "$HOLD_FILE"
-    echo "$pkg|$type|$exp_date" >> "$HOLD_FILE"
-    
+
+    write_hold_line "$pkg" "$type" "$exp_date" "$set"
+
     apply_hold "$pkg" "$type"
-    
+
     if [ "$already_held" = true ]; then
         if [ "$days" -eq 0 ]; then
             echo "Package $pkg ($type) is already being held. Expiration updated to Indefinite."
@@ -212,110 +343,1144 @@ add_hold_entry() {
     fi
 }
 
+# Remove holds and hold-file entries (used by the expiry update terminal)
+unhold_packages() {
+    local type=$1 p; shift
+    for p in "$@"; do
+        remove_hold "$p" "$type"
+        sed -i "/^$p|$type|/d" "$HOLD_FILE"
+    done
+}
+
+# --- Linked package sets ---
+# Some packages only work while a group of packages stays on the same version.
+# The NVIDIA stack is the common case: nvidia-utils, lib32-nvidia-utils,
+# opencl-nvidia and the prebuilt kernel module (for example
+# linux-cachyos-nvidia-open, which also pins the kernel it was built for).
+# Downgrading or holding only one of them makes the package manager refuse,
+# or upgrade the rest on the next update.
+#
+# Each manager's installed packages are turned into records:
+#   id  version  unit  family  exact-deps  other-deps  names  upstream-version
+# unit:   packages built together (pacman pkgbase, deb source+version, source RPM)
+# family: the name without its 32-bit / architecture marker
+# names:  the id plus everything the package provides
+# The engine below grows the set from the selected package until nothing
+# else is linked to it.
+
+declare -gA SET_VER=() SET_WHY=() SET_UNIT=()
+SET_NAMES=()
+SET_CAPPED=false
+
+linked_set_engine() { # root unit-reason family-reason < records
+    awk -F'\t' -v root="$1" -v unitwhy="$2" -v famwhy="$3" -v cap="$LINKED_SET_CAP" '
+        function has(list, x) { return x != "" && index(" " list " ", " " x " ") > 0 }
+        function pins(x, y,   n, i, t) {
+            n = split(xdep[x], t, " ")
+            for (i = 1; i <= n; i++) if (has(names[y], t[i])) return 1
+            return 0
+        }
+        function needs(x, y,   n, i, t) {
+            n = split(pdep[x], t, " ")
+            for (i = 1; i <= n; i++) if (has(names[y], t[i])) return 1
+            return pins(x, y)
+        }
+        function realver(v) { return v ~ /^[0-9]+\.[0-9]/ && length(v) >= 5 }
+        function why(b,   i, a) {
+            for (i = 1; i <= m; i++) {
+                a = order[i]
+                if (unit[b] != "" && unit[b] == unit[a]) return unitwhy " " a
+                if (fam[b] == fam[a]) return famwhy " " a
+                if (pins(b, a)) return "needs the exact version of " a
+                if (pins(a, b)) return a " needs its exact version"
+                if (upv[b] == upv[a] && realver(upv[a]) && (needs(b, a) || needs(a, b)))
+                    return "same version as " a " and depends on it"
+            }
+            return ""
+        }
+        {
+            id = $1; ids[++n] = id; ver[id] = $2; unit[id] = $3; fam[id] = $4
+            xdep[id] = $5; pdep[id] = $6; names[id] = $7; upv[id] = $8
+        }
+        END {
+            if (!(root in ver)) {
+                # apt and dnf list packages without their architecture; use the
+                # first installed copy (native architecture comes first)
+                for (k = 1; k <= n; k++) if (fam[ids[k]] == root || has(names[ids[k]], root) && ids[k] ~ "^" root "[:.]") { root = ids[k]; break }
+                if (!(root in ver)) exit 1
+            }
+            order[m = 1] = root; inset[root] = 1; reason[root] = "selected"
+            do {
+                changed = 0
+                for (k = 1; k <= n && m < cap; k++) {
+                    b = ids[k]
+                    if (b in inset) continue
+                    r = why(b)
+                    if (r != "") { order[++m] = b; inset[b] = 1; reason[b] = r; changed = 1 }
+                }
+            } while (changed && m < cap)
+            for (i = 1; i <= m; i++) print order[i] "\t" ver[order[i]] "\t" reason[order[i]] "\t" unit[order[i]]
+            if (m >= cap) print "__CAPPED__"
+        }'
+}
+
+pacman_local_dump() { # name  version  base  depends  provides
+    local db
+    db=$(pacman-conf DBPath 2>/dev/null)
+    db=${db:-/var/lib/pacman/}
+    awk '
+        function flush() {
+            if (name != "") print name "\t" ver "\t" (base == "" ? name : base) "\t" deps "\t" prov
+            name = ver = base = deps = prov = ""
+        }
+        FNR == 1 { flush() }
+        /^%[A-Z0-9]+%$/ { sec = $0; next }
+        /^$/ { sec = ""; next }
+        sec == "%NAME%" { name = $0 }
+        sec == "%VERSION%" { ver = $0 }
+        sec == "%BASE%" { base = $0 }
+        sec == "%DEPENDS%" { deps = deps (deps == "" ? "" : " ") $0 }
+        sec == "%PROVIDES%" { prov = prov (prov == "" ? "" : " ") $0 }
+        END { flush() }' "${db%/}"/local/*/desc 2>/dev/null
+}
+
+pacman_set_records() {
+    pacman_local_dump | awk -F'\t' '
+        function nm(d) { sub(/[<>=].*/, "", d); return d }
+        function so(d) { return d ~ /\.so([.=]|$)/ }
+        {
+            x = ""; p = ""; nd = split($4, D, " ")
+            for (i = 1; i <= nd; i++) {
+                if (so(D[i])) continue
+                if (D[i] ~ /[^<>]=/) x = x " " nm(D[i]); else p = p " " nm(D[i])
+            }
+            nv = $1; np = split($5, P, " ")
+            for (i = 1; i <= np; i++) if (!so(P[i])) nv = nv " " nm(P[i])
+            fam = $1; sub(/^lib32-/, "", fam)
+            up = $2; sub(/^[0-9]+:/, "", up); sub(/-[^-]*$/, "", up)
+            print $1 "\t" $2 "\t" $3 "\t" fam "\t" x "\t" p "\t" nv "\t" up
+        }'
+}
+
+apt_set_records() {
+    dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\t${Package}\t${Version}\t${source:Package}\t${source:Version}\t${Depends}, ${Pre-Depends}\t${Provides}\n' 2>/dev/null | awk -F'\t' '
+        function nm(d) { gsub(/^[ \t]+|[ \t]+$/, "", d); sub(/[ (].*/, "", d); sub(/:.*/, "", d); return d }
+        $1 !~ /^.i/ { next }
+        {
+            x = ""; p = ""; nd = split($7, D, ",")
+            for (i = 1; i <= nd; i++) {
+                na = split(D[i], A, "|")
+                for (j = 1; j <= na; j++) {
+                    n = nm(A[j]); if (n == "") continue
+                    if (A[j] ~ /\(= /) x = x " " n; else p = p " " n
+                }
+            }
+            nv = $2 " " $3; np = split($8, P, ",")
+            for (i = 1; i <= np; i++) { n = nm(P[i]); if (n != "") nv = nv " " n }
+            up = $4; sub(/^[0-9]+:/, "", up); sub(/-[^-]*$/, "", up)
+            print $2 "\t" $4 "\t" $5 " " $6 "\t" $3 "\t" x "\t" p "\t" nv "\t" up
+        }'
+}
+
+dnf_set_records() {
+    rpm -qa --qf '%{NAME}.%{ARCH}\t%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{SOURCERPM}\t[%{REQUIRENEVRS},]\t[%{PROVIDENEVRS},]\t%{VERSION}\n' 2>/dev/null | awk -F'\t' '
+        function nm(d) { gsub(/^[ \t]+|[ \t]+$/, "", d); sub(/ .*/, "", d); return d }
+        function skip(n) { return n == "" || n ~ /^(rpmlib|config|rtld|\/|\()/ || n ~ /\.so/ }
+        {
+            x = ""; p = ""; nd = split($5, D, ",")
+            for (i = 1; i <= nd; i++) {
+                n = nm(D[i]); if (skip(n)) continue
+                if (D[i] ~ / = /) x = x " " n; else p = p " " n
+            }
+            nv = $1 " " $2; np = split($6, P, ",")
+            for (i = 1; i <= np; i++) { n = nm(P[i]); if (!skip(n)) nv = nv " " n }
+            ver = $3; sub(/^0:/, "", ver)
+            u = ($4 == "(none)" ? "" : $4)
+            print $1 "\t" ver "\t" u "\t" $2 "\t" x "\t" p "\t" nv "\t" $7
+        }'
+}
+
+linked_set() { # type pkg -> name  version  reason  unit
+    case $1 in
+        pacman) pacman_set_records | linked_set_engine "$2" "same package base as" "32-bit counterpart of" ;;
+        apt) apt_set_records | linked_set_engine "$2" "built from the same source as" "other-architecture copy of" ;;
+        dnf) dnf_set_records | linked_set_engine "$2" "built from the same source as" "other-architecture copy of" ;;
+        *) printf '%s\t\tselected\t\n' "$2" ;;
+    esac
+}
+
+load_linked_set() { # type pkg
+    local name ver why unit
+    SET_NAMES=(); SET_VER=(); SET_WHY=(); SET_UNIT=(); SET_CAPPED=false
+    while IFS=$'\t' read -r name ver why unit; do
+        [ -z "$name" ] && continue
+        if [ "$name" = "__CAPPED__" ]; then SET_CAPPED=true; continue; fi
+        SET_NAMES+=("$name"); SET_VER[$name]=$ver; SET_WHY[$name]=$why; SET_UNIT[$name]=$unit
+    done < <(linked_set "$1" "$2")
+    [ ${#SET_NAMES[@]} -gt 0 ]
+}
+
+# Align "a|b|c" lines into columns (falls back to awk where column isn't installed)
+table() {
+    if command -v column &>/dev/null; then
+        column -t -s '|'
+    else
+        awk -F'|' '{ row[NR] = $0; for (i = 1; i <= NF; i++) if (length($i) > w[i]) w[i] = length($i) }
+            END { for (r = 1; r <= NR; r++) { n = split(row[r], c, "|"); line = ""
+                  for (i = 1; i <= n; i++) line = line (i < n ? sprintf("%-" w[i] + 2 "s", c[i]) : c[i]); print line } }'
+    fi
+}
+
+print_linked_set() {
+    local m
+    {
+        echo "PACKAGE|VERSION|LINKED BECAUSE"
+        for m in "${SET_NAMES[@]}"; do echo "$m|${SET_VER[$m]}|${SET_WHY[$m]}"; done
+    } | table | sed 's/^/  /'
+    if [ "$SET_CAPPED" = true ]; then
+        echo "  (stopped at $LINKED_SET_CAP packages; the real set is larger)"
+    fi
+}
+
+# --- Fetching (cached for this run) ---
+
+fetch_cached() {
+    local f
+    f="$RM_TMPDIR/fetch-$(printf '%s' "$1" | md5sum | cut -c1-16)"
+    if [ ! -e "$f" ]; then
+        if curl -fsL --max-time 25 "$1" -o "$f.part" 2>/dev/null; then mv "$f.part" "$f"; else rm -f "$f.part"; : > "$f"; fi
+    fi
+    cat "$f"
+}
+
+listing_hrefs() { grep -o 'href="[^"?]*"' | sed 's/^href="//; s/"$//'; }
+
+# --- pacman: finding older versions ---
+
+pacman_allowed_arches() {
+    local a
+    a=$(pacman-conf Architecture 2>/dev/null | tr '\n' ' ')
+    case " $a " in *" auto "*|"  ") a="$a $(uname -m)" ;; esac
+    echo " any $a "
+}
+
+parse_pkg_filename() { # file -> PF_NAME PF_VER PF_ARCH
+    local fn=${1##*/} ver rel
+    case "$fn" in *.sig|*.part) return 1 ;; *.pkg.tar.*) ;; *) return 1 ;; esac
+    fn=${fn//%3A/:}; fn=${fn//%3a/:}
+    fn=${fn%.pkg.tar*}
+    PF_ARCH=${fn##*-}; fn=${fn%-*}
+    rel=${fn##*-}; fn=${fn%-*}
+    ver=${fn##*-}
+    PF_NAME=${fn%-*}
+    [ "$PF_NAME" != "$fn" ] || return 1
+    PF_VER="$ver-$rel"
+}
+
+pacman_sync_list() {
+    local f="$RM_TMPDIR/sync-list"
+    [ -e "$f" ] || pacman -Sl 2>/dev/null > "$f"
+    cat "$f"
+}
+
+pacman_remote_listing() { # dir-url name label priority
+    local base=$1 name=$2 label=$3 prio=$4 arches href
+    arches=$(pacman_allowed_arches)
+    while read -r href; do
+        parse_pkg_filename "$href" || continue
+        [ "$PF_NAME" = "$name" ] || continue
+        [[ "$arches" == *" $PF_ARCH "* ]] || continue
+        printf '%s\t%s\t%s\t%s\n' "$PF_VER" "${base%/}/${href##*/}" "$label" "$prio"
+    done < <(fetch_cached "$base" | listing_hrefs)
+}
+
+pacman_uses_cachyos() {
+    [ -n "$ROLLBACK_MGR_CACHYOS" ] || pacman-conf --repo-list 2>/dev/null | grep -q '^cachyos'
+}
+
+pacman_cachyos_archive() { # name
+    pacman_uses_cachyos || return 0
+    local name=$1 repos dirs="cachyos" d sub
+    repos=$(pacman-conf --repo-list 2>/dev/null)
+    if grep -q -- '-v3$' <<< "$repos"; then dirs+=" cachyos-v3"; fi
+    if grep -qE -- '-(v4|znver4)$' <<< "$repos"; then dirs+=" cachyos-v4"; fi
+    if [ -n "$ROLLBACK_MGR_CACHYOS" ]; then dirs="cachyos cachyos-v3 cachyos-v4"; fi
+    for d in $dirs; do
+        pacman_remote_listing "$CACHYOS_ARCHIVE_URL/archive/$d/" "$name" "CachyOS archive" 3
+    done
+    # CachyOS keeps NVIDIA driver bundles in /nvidia/<branch>/
+    case "$name" in
+        *nvidia*|libxnvctrl)
+            while read -r sub; do
+                case "$sub" in ../|./|/*|*://*) continue ;; */) ;; *) continue ;; esac
+                pacman_remote_listing "$CACHYOS_ARCHIVE_URL/nvidia/$sub" "$name" "CachyOS NVIDIA archive" 3
+            done < <(fetch_cached "$CACHYOS_ARCHIVE_URL/nvidia/" | listing_hrefs)
+            ;;
+    esac
+}
+
+pacman_sort_versions() { # newest first; the epoch counts first
+    awk -F'\t' '{ v = $1; e = 0; if (match(v, /^[0-9]+:/)) { e = substr(v, 1, RLENGTH - 1); v = substr(v, RLENGTH + 1) }
+                  printf "%08d:%s\t%s\n", e, v, $0 }' | sort -t$'\t' -k1,1Vr | cut -f2-
+}
+
+# All versions of a package that can be installed: version  source  where
+pacman_find_versions() {
+    local name=$1 arches dir f repo rver url
+    arches=$(pacman_allowed_arches)
+    {
+        while read -r dir; do
+            [ -d "$dir" ] || continue
+            for f in "${dir%/}/$name"-*.pkg.tar.*; do
+                parse_pkg_filename "$f" || continue
+                [ "$PF_NAME" = "$name" ] || continue
+                [[ "$arches" == *" $PF_ARCH "* ]] || continue
+                printf '%s\t%s\t%s\t1\n' "$PF_VER" "$f" "package cache"
+            done
+        done < <(pacman-conf CacheDir 2>/dev/null || echo /var/cache/pacman/pkg/)
+        while read -r repo rver; do
+            url=$(pacman -Sddp --print-format '%l' "$repo/$name" 2>/dev/null | head -n1)
+            [ -n "$url" ] && printf '%s\t%s\t%s\t2\n' "$rver" "$url" "$repo repo"
+        done < <(pacman_sync_list | awk -v n="$name" '$2 == n {print $1, $3}')
+        pacman_cachyos_archive "$name"
+        pacman_remote_listing "$ALA_URL/${name:0:1}/$name/" "$name" "Arch archive" 4
+    } | sort -t$'\t' -k4,4n -s | awk -F'\t' '!seen[$1]++ {print $1 "\t" $2 "\t" $3}' | pacman_sort_versions
+}
+
+pacman_cand_file() { # name -> file listing its versions (looked up once per run)
+    local f="$RM_TMPDIR/cand-$1"
+    [ -e "$f" ] || pacman_find_versions "$1" > "$f"
+    echo "$f"
+}
+
+pacman_cand_lookup() { # name version -> "source<TAB>where"
+    awk -F'\t' -v v="$2" '$1 == v {print $2 "\t" $3; exit}' "$(pacman_cand_file "$1")"
+}
+
+pacman_pkginfo() { # source -> "depend X" / "provides X" lines
+    case "$1" in
+        *://*) curl -fsL --max-time 120 "$1" 2>/dev/null | bsdtar -xqOf - .PKGINFO 2>/dev/null ;;
+        *) bsdtar -xqOf "$1" .PKGINFO 2>/dev/null ;;
+    esac | awk -F' = ' '$1 == "depend" || $1 == "provides" {print $1, $2}'
+}
+
+# --- pacman: choosing versions for a linked set ---
+# ASSIGN[pkg]   target version ("remove" when a DKMS module replaces it)
+# ASSIGN_SRC    package file or URL to install ("" when unchanged)
+# ASSIGN_WHERE  where that file was found
+# INFO_DEP / INFO_PROV  depends and provides of the target version
+
+declare -gA ASSIGN=() ASSIGN_SRC=() ASSIGN_WHERE=() INFO_DEP=() INFO_PROV=()
+EXTRA_NAMES=()
+PIN_CONFLICT=""
+NEEDS_REBOOT=false
+
+pacman_reset_plan() {
+    ASSIGN=(); ASSIGN_SRC=(); ASSIGN_WHERE=(); INFO_DEP=(); INFO_PROV=(); EXTRA_NAMES=(); PIN_CONFLICT=""
+    pacman_local_dump > "$RM_TMPDIR/local-dump"
+}
+
+pacman_load_info() { # name version source
+    local name=$1 info
+    if [ -z "$3" ]; then
+        INFO_DEP[$name]=$(awk -F'\t' -v n="$name" '$1 == n {print $4; exit}' "$RM_TMPDIR/local-dump")
+        INFO_PROV[$name]=$(awk -F'\t' -v n="$name" '$1 == n {print $5; exit}' "$RM_TMPDIR/local-dump")
+    else
+        info=$(pacman_pkginfo "$3")
+        INFO_DEP[$name]=$(awk '$1 == "depend" {print $2}' <<< "$info" | tr '\n' ' ')
+        INFO_PROV[$name]=$(awk '$1 == "provides" {print $2}' <<< "$info" | tr '\n' ' ')
+    fi
+}
+
+pacman_upver() { local v=${1#*:}; echo "${v%-*}"; }
+
+pacman_provides() { # name provides-list -> provided version of name ("" if not provided)
+    tr ' ' '\n' <<< "$2" | awk -F= -v n="$1" '$1 == n {print ($2 == "" ? "-" : $2); exit}'
+}
+
+# Every exact (=) dependency between packages in the plan must hold
+pacman_pins_ok() {
+    local a b d dn dv have pv
+    for a in "${!ASSIGN[@]}"; do
+        [ "${ASSIGN[$a]}" = "remove" ] && continue
+        for d in ${INFO_DEP[$a]}; do
+            case "$d" in *">="*|*"<="*|*.so=*|*.so) continue ;; *=*) ;; *) continue ;; esac
+            dn=${d%%=*}; dv=${d#*=}
+            for b in "${!ASSIGN[@]}"; do
+                [ "${ASSIGN[$b]}" = "remove" ] && continue
+                if [ "$b" = "$dn" ]; then
+                    have=${ASSIGN[$b]}
+                else
+                    pv=$(pacman_provides "$dn" "${INFO_PROV[$b]}")
+                    [ -n "$pv" ] || continue
+                    [ "$pv" = "-" ] && pv=${ASSIGN[$b]}
+                    have=$pv
+                fi
+                if [ "$(vercmp "$have" "$dv")" != 0 ]; then
+                    PIN_CONFLICT="$a needs $dn=$dv, but $b would be ${ASSIGN[$b]}"
+                    return 1
+                fi
+            done
+        done
+    done
+    return 0
+}
+
+pacman_unit_members() { # unit
+    local m
+    for m in "${SET_NAMES[@]}"; do [ "${SET_UNIT[$m]}" = "$1" ] && echo "$m"; done
+}
+
+# Put every member of a unit (one pkgbase) at version cv, if possible
+pacman_try_unit() { # unit cv
+    local u=$1 cv=$2 m src
+    local -a mem
+    mapfile -t mem < <(pacman_unit_members "$u")
+    for m in "${mem[@]}"; do
+        [ "${SET_VER[$m]}" = "$cv" ] && continue
+        [ -n "$(pacman_cand_lookup "$m" "$cv")" ] || return 1
+    done
+    for m in "${mem[@]}"; do
+        ASSIGN[$m]=$cv
+        if [ "${SET_VER[$m]}" = "$cv" ]; then
+            ASSIGN_SRC[$m]=""; ASSIGN_WHERE[$m]=""
+            pacman_load_info "$m" "$cv" ""
+        else
+            src=$(pacman_cand_lookup "$m" "$cv")
+            ASSIGN_SRC[$m]=${src%%$'\t'*}; ASSIGN_WHERE[$m]=${src#*$'\t'}
+            pacman_load_info "$m" "$cv" "${ASSIGN_SRC[$m]}"
+        fi
+    done
+    if pacman_pins_ok; then return 0; fi
+    for m in "${mem[@]}"; do unset "ASSIGN[$m]"; done
+    return 1
+}
+
+pacman_unit_has_module() { # unit -> prints the prebuilt NVIDIA module packages in it
+    local m
+    for m in $(pacman_unit_members "$1"); do
+        if [[ " $(awk -F'\t' -v n="$m" '$1 == n {print $5; exit}' "$RM_TMPDIR/local-dump") " == *" NVIDIA-MODULE"* ]] \
+           && [[ "$m" != *-dkms ]]; then
+            echo "$m"
+        fi
+    done
+}
+
+# The prebuilt module for the wanted driver and the kernel you run doesn't exist
+# (CachyOS builds each module for one kernel and one driver). Replace it with
+# the DKMS module, which builds on your machine for whatever kernel is installed.
+pacman_try_dkms_swap() { # unit driver-version
+    local u=$1 drv=$2 m dk="nvidia-dkms" src v k hdr hv
+    local -a mods
+    mapfile -t mods < <(pacman_unit_has_module "$u")
+    [ ${#mods[@]} -gt 0 ] || return 1
+    for m in "${mods[@]}"; do [[ "$m" == *open* ]] && dk="nvidia-open-dkms"; done
+
+    # the DKMS package at the same driver version (same pkgrel preferred)
+    v=$(awk -F'\t' -v up="$(pacman_upver "$drv")" -v full="$drv" '
+            { x = $1; sub(/^[0-9]+:/, "", x); sub(/-[^-]*$/, "", x) }
+            x == up && $1 == full { print $1; found = 1; exit }
+            x == up && !first { first = $1 }
+            END { if (!found && first) print first }' "$(pacman_cand_file "$dk")")
+    if [ -z "$v" ]; then
+        echo "No $dk $(pacman_upver "$drv") was found either, so the module can't be replaced."
+        return 1
+    fi
+
+    echo ""
+    echo "No prebuilt ${mods[*]} was found that matches NVIDIA $(pacman_upver "$drv") and your kernel."
+    echo "rollback-mgr can replace it with $dk $v, which builds the NVIDIA module on your machine."
+    echo "It needs the dkms package and your kernel's headers, which will be added if missing."
+    read -p "Replace ${mods[*]} with $dk $v? (y/N): " swap_ans
+    [[ "$swap_ans" =~ ^[Yy]$ ]] || return 1
+
+    # the rest of the unit (the kernel and its headers) stays where it is
+    for m in $(pacman_unit_members "$u"); do
+        if [[ " ${mods[*]} " == *" $m "* ]]; then
+            ASSIGN[$m]="remove"; ASSIGN_SRC[$m]=""; ASSIGN_WHERE[$m]="replaced by $dk"
+        elif [ -z "${ASSIGN[$m]}" ]; then
+            ASSIGN[$m]=${SET_VER[$m]}; ASSIGN_SRC[$m]=""; ASSIGN_WHERE[$m]=""
+            pacman_load_info "$m" "${SET_VER[$m]}" ""
+        fi
+    done
+
+    src=$(pacman_cand_lookup "$dk" "$v")
+    pacman_add_extra "$dk" "$v" "$src" "replaces ${mods[*]}"
+
+    if ! pacman -Qq dkms &>/dev/null && [ -z "${ASSIGN[dkms]}" ]; then
+        v=$(head -n1 "$(pacman_cand_file dkms)" | cut -f1)
+        if [ -z "$v" ]; then echo "The dkms package wasn't found."; return 1; fi
+        pacman_add_extra dkms "$v" "$(pacman_cand_lookup dkms "$v")" "needed to build $dk"
+    fi
+
+    # headers for every kernel the module was built for
+    for m in "${mods[@]}"; do
+        for k in $(awk -F'\t' -v n="$m" '$1 == n {print $4; exit}' "$RM_TMPDIR/local-dump"); do
+            case "$k" in linux*=*) ;; *) continue ;; esac
+            k=${k%%=*}; hdr="$k-headers"
+            if pacman -Qq "$hdr" &>/dev/null || [ -n "${ASSIGN[$hdr]}" ]; then continue; fi
+            hv=${ASSIGN[$k]:-$(pacman -Q "$k" 2>/dev/null | awk '{print $2}')}
+            src=$(pacman_cand_lookup "$hdr" "$hv")
+            if [ -z "$src" ]; then echo "$hdr $hv (needed to build the module) wasn't found."; return 1; fi
+            pacman_add_extra "$hdr" "$hv" "$src" "needed to build $dk for $k"
+        done
+    done
+    pacman_pins_ok
+}
+
+pacman_add_extra() { # name version "source<TAB>where" reason
+    ASSIGN[$1]=$2; ASSIGN_SRC[$1]=${3%%$'\t'*}; ASSIGN_WHERE[$1]=${3#*$'\t'}
+    EXTRA_NAMES+=("$1"); SET_WHY[$1]=$4
+    pacman_load_info "$1" "$2" "${ASSIGN_SRC[$1]}"
+}
+
+# Pick mode: the user chose version V of the primary package
+pacman_resolve_pick() { # primary V
+    local primary=$1 V=$2 u m cv tracking
+    local -a units cands
+    declare -A seen_u=()
+    for m in "${SET_NAMES[@]}"; do
+        u=${SET_UNIT[$m]}
+        [ -n "${seen_u[$u]}" ] && continue
+        seen_u[$u]=1; units+=("$u")
+    done
+
+    start_spinner "Matching the rest of the set to $primary $V..."
+    if ! pacman_try_unit "${SET_UNIT[$primary]}" "$V"; then
+        stop_spinner
+        for m in $(pacman_unit_members "${SET_UNIT[$primary]}"); do
+            if [ "${SET_VER[$m]}" != "$V" ] && [ -z "$(pacman_cand_lookup "$m" "$V")" ]; then
+                echo "$m $V wasn't found (it has to match $primary)."
+            fi
+        done
+        [ -n "$PIN_CONFLICT" ] && echo "$PIN_CONFLICT"
+        return 1
+    fi
+
+    local anchor TV
+    for u in "${units[@]:1}"; do
+        m=$(pacman_unit_members "$u" | head -n1)
+        # A unit that follows another package's version (a 32-bit copy, or a tool
+        # that depends on the driver) gets that package's chosen version
+        anchor=""; tracking=false
+        case "${SET_WHY[$m]}" in
+            "32-bit counterpart of "*) anchor=${SET_WHY[$m]#32-bit counterpart of } ;;
+            "same version as "*" and depends on it") anchor=${SET_WHY[$m]#same version as }; anchor=${anchor% and depends on it} ;;
+        esac
+        if [ -n "$anchor" ] && [ -n "${ASSIGN[$anchor]}" ] && [ "${ASSIGN[$anchor]}" != "remove" ]; then
+            tracking=true; TV=${ASSIGN[$anchor]}
+        fi
+        if [ "$tracking" = true ]; then
+            mapfile -t cands < <( { echo "${SET_VER[$m]}"; cut -f1 "$(pacman_cand_file "$m")"; } | awk -v up="$(pacman_upver "$TV")" -v rel="${TV##*-}" '
+                { x = $0; sub(/^[0-9]+:/, "", x); r = x; sub(/-[^-]*$/, "", x); sub(/.*-/, "", r) }
+                x == up && !seen[$0]++ { if (r == rel) print; else rest[++n] = $0 }
+                END { for (i = 1; i <= n; i++) print rest[i] }')
+            # A package that only depends on the driver (nvidia-settings) may stay
+            # where it is when no matching build is found. 32-bit copies may not:
+            # they must match the driver exactly.
+            if [[ "${SET_WHY[$m]}" != "32-bit counterpart"* ]]; then
+                cands+=("${SET_VER[$m]}")
+            fi
+        else
+            # independent version (for example a kernel): keep it if it still fits
+            mapfile -t cands < <( { echo "${SET_VER[$m]}"; cut -f1 "$(pacman_cand_file "$m")" | head -n 8; } | awk '!seen[$0]++')
+        fi
+        local placed=false
+        for cv in "${cands[@]}"; do
+            if pacman_try_unit "$u" "$cv"; then placed=true; break; fi
+        done
+        if [ "$placed" = true ] && [ "$tracking" = true ] && [ "$(pacman_upver "$cv")" != "$(pacman_upver "$TV")" ]; then
+            stop_spinner
+            echo "Note: no $(pacman_unit_members "$u" | tr '\n' ' ')build for $(pacman_upver "$TV") was found, so it stays at $cv."
+            echo "      It doesn't need an exact driver version, so this is safe."
+            start_spinner "Matching the rest of the set..."
+        fi
+        if [ "$placed" = false ]; then
+            stop_spinner
+            if [ -n "$(pacman_unit_has_module "$u")" ] && pacman_try_dkms_swap "$u" "${ASSIGN[nvidia-utils]:-$V}"; then
+                start_spinner "Matching the rest of the set..."
+                continue
+            fi
+            echo "No version of $(pacman_unit_members "$u" | tr '\n' ' ')was found that works with $primary $V."
+            [ -n "$PIN_CONFLICT" ] && echo "($PIN_CONFLICT)"
+            echo "Try restoring an earlier state from your pacman history instead."
+            return 1
+        fi
+    done
+    stop_spinner
+    return 0
+}
+
+# Restore points: the state of the set just before each pacman transaction that changed it
+pacman_restore_points() { # prints: when  summary  state(name=ver,...)
+    local log state="" m
+    log=$(pacman-conf LogFile 2>/dev/null); log=${log:-/var/log/pacman.log}
+    [ -r "$log" ] || return 0
+    for m in "${SET_NAMES[@]}"; do state+="$m=${SET_VER[$m]} "; done
+    awk -v cur="$state" '
+        BEGIN { n = split(cur, C, " "); for (i = 1; i <= n; i++) { split(C[i], kv, "="); curv[kv[1]] = substr(C[i], length(kv[1]) + 2); mem[++nm] = kv[1] } }
+        / \[ALPM\] transaction started$/ { t++; ts = substr($1, 2, 16); sub(/T/, " ", ts); when[t] = ts; next }
+        / \[ALPM\] (upgraded|downgraded|installed|removed) / {
+            name = $4; if (!(name in curv)) next
+            e++; et[e] = t; en[e] = name
+            if ($3 == "upgraded" || $3 == "downgraded") { old = $5; sub(/^\(/, "", old); new = $7; sub(/\)$/, "", new) }
+            else if ($3 == "installed") { old = ""; new = $5; gsub(/[()]/, "", new) }
+            else { old = $5; gsub(/[()]/, "", old); new = "" }
+            eo[e] = old; enew[e] = new; touched[t] = 1
+        }
+        END {
+            shown = 0
+            for (tx = t; tx >= 1 && shown < 15; tx--) {
+                if (!(tx in touched)) continue
+                st = ""; diff = 0; summary = ""; more = 0
+                for (i = 1; i <= nm; i++) {
+                    mm = mem[i]; v = curv[mm]
+                    for (k = 1; k <= e; k++) if (en[k] == mm && et[k] >= tx) { v = eo[k]; break }
+                    st = st (st == "" ? "" : ",") mm "=" v
+                    if (v != curv[mm]) {
+                        if (v != "") diff = 1
+                        if (length(summary) < 90) summary = summary (summary == "" ? "" : ", ") mm " " (v == "" ? "(not installed)" : v)
+                        else more++
+                    }
+                }
+                if (!diff || (st in seen)) continue
+                seen[st] = 1; shown++
+                if (more) summary = summary " (+" more " more)"
+                print when[tx] "\t" summary "\t" st
+            }
+        }' "$log"
+}
+
+pacman_resolve_restore() { # state
+    local pair m v src
+    local -a missing=()
+    for pair in ${1//,/ }; do
+        m=${pair%%=*}; v=${pair#*=}
+        if [ -z "$v" ]; then
+            # installed after that point; leave it as it is
+            ASSIGN[$m]=${SET_VER[$m]}; ASSIGN_SRC[$m]=""; ASSIGN_WHERE[$m]="not installed back then, left as is"
+            pacman_load_info "$m" "${SET_VER[$m]}" ""
+        elif [ "$v" = "${SET_VER[$m]}" ]; then
+            ASSIGN[$m]=$v; ASSIGN_SRC[$m]=""; ASSIGN_WHERE[$m]=""
+            pacman_load_info "$m" "$v" ""
+        else
+            src=$(pacman_cand_lookup "$m" "$v")
+            if [ -z "$src" ]; then missing+=("$m"); continue; fi
+            ASSIGN[$m]=$v; ASSIGN_SRC[$m]=${src%%$'\t'*}; ASSIGN_WHERE[$m]=${src#*$'\t'}
+            pacman_load_info "$m" "$v" "${ASSIGN_SRC[$m]}"
+        fi
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        local u mods drv
+        for m in "${missing[@]}"; do
+            u=${SET_UNIT[$m]}
+            mods=$(pacman_unit_has_module "$u")
+            if [[ " $(echo $mods) " != *" $m "* ]]; then
+                echo "These old versions weren't found in your package cache or the archives:"
+                printf '  %s\n' "${missing[@]}"
+                return 1
+            fi
+        done
+        # only prebuilt NVIDIA modules are missing: offer the DKMS module instead
+        drv=""
+        for m in "${SET_NAMES[@]}"; do [ "$m" = "nvidia-utils" ] && drv=${ASSIGN[$m]}; done
+        if [ -z "$drv" ] || ! pacman_try_dkms_swap "${SET_UNIT[${missing[0]}]}" "$drv"; then
+            echo "The old ${missing[*]} wasn't found in your package cache or the archives."
+            return 1
+        fi
+    fi
+    if ! pacman_pins_ok; then
+        echo "That earlier state doesn't fit together: $PIN_CONFLICT"
+        return 1
+    fi
+}
+
+pacman_print_plan() {
+    local m
+    echo ""
+    echo "Planned changes (one pacman transaction):"
+    {
+        for m in "${SET_NAMES[@]}" "${EXTRA_NAMES[@]}"; do
+            [ -n "${ASSIGN[$m]}" ] || continue
+            if [ "${ASSIGN[$m]}" = "remove" ]; then
+                echo "$m|${SET_VER[$m]} -> removed|${ASSIGN_WHERE[$m]}"
+            elif [ -z "${SET_VER[$m]}" ]; then
+                echo "$m|install ${ASSIGN[$m]}|${ASSIGN_WHERE[$m]} (${SET_WHY[$m]})"
+            elif [ "${ASSIGN[$m]}" = "${SET_VER[$m]}" ]; then
+                echo "$m|${SET_VER[$m]} (unchanged)|${ASSIGN_WHERE[$m]}"
+            else
+                echo "$m|${SET_VER[$m]} -> ${ASSIGN[$m]}|${ASSIGN_WHERE[$m]}"
+            fi
+        done
+    } | table | sed 's/^/  /'
+}
+
+# Install the plan in one transaction. pacman -U ignores IgnorePkg, so existing
+# holds stay in place whether this works or not.
+pacman_run_plan() {
+    local m
+    local -a srcs=()
+    FINAL_MEMBERS=()
+    for m in "${SET_NAMES[@]}" "${EXTRA_NAMES[@]}"; do
+        [ -n "${ASSIGN[$m]}" ] || continue
+        [ "${ASSIGN[$m]}" = "remove" ] || FINAL_MEMBERS+=("$m")
+        [ -n "${ASSIGN_SRC[$m]}" ] && srcs+=("${ASSIGN_SRC[$m]}")
+    done
+    if [ ${#srcs[@]} -eq 0 ]; then
+        echo "Nothing to change: the set is already at those versions."
+        return 1
+    fi
+    pacman_print_plan
+
+    local swapping=false
+    for m in "${SET_NAMES[@]}"; do [ "${ASSIGN[$m]}" = "remove" ] && swapping=true; done
+    if [ "$swapping" = false ]; then
+        # dry run: pacman checks every dependency without changing anything
+        start_spinner "Checking the transaction with pacman..."
+        local out
+        out=$(sudo pacman -U --print --print-format '%n %v' "${srcs[@]}" 2>&1)
+        local rc=$?
+        stop_spinner
+        if [ $rc -ne 0 ]; then
+            echo "pacman would refuse this change, so nothing was changed:"
+            grep -vE '^(warning: database file|$)' <<< "$out" | sed 's/^/  /'
+            return 1
+        fi
+    else
+        echo "  (pacman will ask to remove the prebuilt module; answer y)"
+    fi
+
+    echo ""
+    read -p "Apply these changes? (y/N): " apply_ans
+    [[ "$apply_ans" =~ ^[Yy]$ ]] || return 1
+
+    # shellcheck disable=SC2086
+    sudo pacman -U $TXN_FLAGS "${srcs[@]}" || return 1
+
+    for m in "${SET_NAMES[@]}"; do
+        if [ "${ASSIGN[$m]}" = "remove" ] && grep -q "^$m|pacman|" "$HOLD_FILE"; then
+            unhold_packages pacman "$m"
+        fi
+    done
+    return 0
+}
+
+pacman_set_downgrade() { # primary
+    local primary=$1 mode="" sel V
+    pacman_reset_plan
+
+    local points
+    start_spinner "Reading pacman history..."
+    points=$(pacman_restore_points)
+    stop_spinner
+
+    if [ -n "$points" ]; then
+        mode=$(printf "1. Restore the set to an earlier state (from pacman history)\n2. Choose a version of %s\n" "$primary" | fzf --prompt="How do you want to roll back? (Esc to cancel) > " --height=6 --layout=reverse)
+        [ -z "$mode" ] && return 1
+    else
+        mode="2."
+    fi
+
+    if [[ "$mode" == 1.* ]]; then
+        sel=$(awk -F'\t' '{printf "%d. Before %s: %s\t%s\n", NR, $1, $2, $3}' <<< "$points" | fzf --prompt="Restore point (Esc to cancel) > " --height=17 --layout=reverse --delimiter=$'\t' --with-nth=1)
+        [ -z "$sel" ] && return 1
+        pacman_resolve_restore "${sel#*$'\t'}" || return 1
+    else
+        start_spinner "Looking for versions of $primary (cache, repos, archives)..."
+        local list
+        list=$(pacman_cand_file "$primary")
+        stop_spinner
+        if [ ! -s "$list" ]; then
+            echo "No other versions of $primary were found in your cache, repos or the archives."
+            return 1
+        fi
+        sel=$(awk -F'\t' -v cur="${SET_VER[$primary]}" '{ printf "%s\t%s%s\n", $1, $3, ($1 == cur ? "  <-- (Installed)" : "") }' "$list" \
+              | tr '\t' '|' | table | fzf --prompt="Select $primary version (Esc to cancel) > " --header="Currently installed: ${SET_VER[$primary]}" --height=15 --layout=reverse)
+        [ -z "$sel" ] && return 1
+        V=$(awk '{print $1}' <<< "$sel")
+        if [ "$V" = "${SET_VER[$primary]}" ] && [ ${#SET_NAMES[@]} -eq 1 ]; then
+            echo "$primary $V is already installed."
+            return 1
+        fi
+        pacman_resolve_pick "$primary" "$V" || return 1
+    fi
+
+    pacman_run_plan
+}
+
+# --- APT: linked sets ---
+
+apt_stanzas() { # pkg -> version  source  source-version  depends   (one line per version)
+    apt-cache show "$1" 2>/dev/null | awk '
+        function out() {
+            if (v != "" && !seen[v]++) print v "\t" (s == "" ? p : s) "\t" (sv == "" ? v : sv) "\t" d
+            p = v = s = sv = d = ""
+        }
+        /^Package: / { p = $2 }
+        /^Version: / { v = $2 }
+        /^Source: / { s = $2; sv = $3; gsub(/[()]/, "", sv) }
+        /^(Pre-)?Depends: / { d = d ", " substr($0, index($0, ": ") + 2) }
+        /^$/ { out() }
+        END { out() }'
+}
+
+apt_pin_version() { # depends-string name -> version pinned with "="
+    tr ',|' '\n\n' <<< "$1" | awk -v n="$2" '
+        { x = $0; gsub(/^[ \t]+/, "", x); nm = x; sub(/[ (].*/, "", nm); sub(/:.*/, "", nm)
+          if (nm == n && x ~ /\(= /) { v = x; sub(/.*\(= */, "", v); sub(/\).*/, "", v); print v; exit } }'
+}
+
+declare -gA ADEPS=()
+
+apt_pins_consistent() { # member version depends -> 0 if every = pin with the plan holds
+    local m=$1 cv=$2 mdeps=$3 a pin
+    for a in "${!ASSIGN[@]}"; do
+        [ "$a" = "$m" ] && continue
+        pin=$(apt_pin_version "$mdeps" "${a%%:*}")
+        if [ -n "$pin" ] && [ "$pin" != "${ASSIGN[$a]}" ]; then return 1; fi
+        pin=$(apt_pin_version "${ADEPS[$a]}" "${m%%:*}")
+        if [ -n "$pin" ] && [ "$pin" != "$cv" ]; then return 1; fi
+    done
+    return 0
+}
+
+apt_set_downgrade() { # primary
+    local primary=$1 m V srcv sel tv cur
+    ASSIGN=(); ADEPS=()
+
+    start_spinner "Fetching APT versions for $primary..."
+    local stanzas versions
+    stanzas=$(apt_stanzas "$primary")
+    versions=$(cut -f1 <<< "$stanzas")
+    stop_spinner
+    if [ "$(grep -c . <<< "$versions")" -le 1 ]; then
+        echo "Only one version of $primary is in your APT sources, so the set can't be rolled back from them."
+        return 1
+    fi
+    sel=$(awk -v curr="${SET_VER[$primary]}" '{ if ($1 == curr) print $0 "  <-- (Installed)"; else print $0 }' <<< "$versions" \
+          | fzf --prompt="Select $primary version (Esc to cancel) > " --height=10 --layout=reverse)
+    V=$(awk '{print $1}' <<< "$sel")
+    [ -z "$V" ] && return 1
+    srcv=$(awk -F'\t' -v v="$V" '$1 == v {print $3; exit}' <<< "$stanzas")
+    ASSIGN[$primary]=$V
+    ADEPS[$primary]=$(awk -F'\t' -v v="$V" '$1 == v {print $4; exit}' <<< "$stanzas")
+
+    start_spinner "Matching the rest of the set..."
+    for m in "${SET_NAMES[@]:1}"; do
+        local mst
+        mst=$(apt_stanzas "$m")
+        tv=""
+        if [ "${SET_UNIT[$m]}" = "${SET_UNIT[$primary]}" ]; then
+            # same source package: take the build of the same source version
+            tv=$(awk -F'\t' -v s="$srcv" '$3 == s {print $1; exit}' <<< "$mst")
+        else
+            # linked by an exact dependency: keep it if it still fits, else find one that does
+            cur=${SET_VER[$m]}
+            for cand in "$cur" $(cut -f1 <<< "$mst"); do
+                local deps
+                deps=$(awk -F'\t' -v v="$cand" '$1 == v {print $4; exit}' <<< "$mst")
+                if apt_pins_consistent "$m" "$cand" "$deps"; then tv=$cand; break; fi
+            done
+        fi
+        if [ -z "$tv" ]; then
+            stop_spinner
+            echo "No version of $m was found that matches $primary $V."
+            return 1
+        fi
+        ASSIGN[$m]=$tv
+        ADEPS[$m]=$(awk -F'\t' -v v="$tv" '$1 == v {print $4; exit}' <<< "$mst")
+    done
+    stop_spinner
+
+    local -a specs=()
+    echo ""
+    echo "Planned changes (one APT transaction):"
+    {
+        for m in "${SET_NAMES[@]}"; do
+            if [ "${ASSIGN[$m]}" = "${SET_VER[$m]}" ]; then
+                echo "$m|${SET_VER[$m]} (unchanged)"
+            else
+                echo "$m|${SET_VER[$m]} -> ${ASSIGN[$m]}"
+                specs+=("$m=${ASSIGN[$m]}")
+            fi
+        done
+    } > "$RM_TMPDIR/apt-plan"
+    table < "$RM_TMPDIR/apt-plan" | sed 's/^/  /'
+    if [ ${#specs[@]} -eq 0 ]; then echo "Nothing to change."; return 1; fi
+
+    # dry run first: apt resolves everything without changing anything
+    local sim
+    sim=$(apt-get install -s --allow-downgrades --allow-change-held-packages "${specs[@]}" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "APT would refuse this change, so nothing was changed:"
+        grep -E '^(E:| )' <<< "$sim" | head -n 15 | sed 's/^/  /'
+        return 1
+    fi
+    if grep -q '^Remv ' <<< "$sim"; then
+        echo "APT would also remove:"
+        grep '^Remv ' <<< "$sim" | awk '{print "  " $2}'
+    fi
+
+    echo ""
+    read -p "Apply these changes? (y/N): " apply_ans
+    [[ "$apply_ans" =~ ^[Yy]$ ]] || return 1
+    # --allow-change-held-packages leaves existing holds in place
+    # shellcheck disable=SC2086
+    sudo apt-get install -y --allow-downgrades --allow-change-held-packages $TXN_FLAGS "${specs[@]}" || return 1
+    FINAL_MEMBERS=("${SET_NAMES[@]}")
+    return 0
+}
+
+# --- DNF: linked sets ---
+
+dnf_versions() { # name.arch -> evr  sourcerpm   (newest first)
+    # dnf repoquery lists every version in the enabled repos (dnf5 rejects --showduplicates here).
+    # Real tab and newline characters: dnf5 does not turn \t into a tab.
+    dnf repoquery -q --qf $'%{evr}\t%{sourcerpm}\t%{arch}\n' "$1" 2>/dev/null \
+        | awk -F'\t' -v a="${1##*.}" 'NF >= 3 && $3 == a && !seen[$1]++ { v = $1; sub(/^0:/, "", v); print v "\t" $2 }' \
+        | sort -t$'\t' -k1,1Vr
+}
+
+dnf_requires() { # name.arch evr -> requirement strings
+    local n=${1%.*} a=${1##*.}
+    dnf repoquery -q --requires "$n-$2.$a" 2>/dev/null
+}
+
+dnf_set_downgrade() { # primary (name.arch)
+    local primary=$1 m V srpm tv sel
+    ASSIGN=()
+    start_spinner "Fetching DNF versions for $primary..."
+    local pv
+    pv=$(dnf_versions "$primary")
+    stop_spinner
+    if [ "$(grep -c . <<< "$pv")" -le 1 ]; then
+        echo "Only one version of $primary is in your DNF repos."
+        return 1
+    fi
+    sel=$(cut -f1 <<< "$pv" | awk -v curr="${SET_VER[$primary]}" '{ if ($1 == curr) print $0 "  <-- (Installed)"; else print $0 }' \
+          | fzf --prompt="Select $primary version (Esc to cancel) > " --height=10 --layout=reverse)
+    V=$(awk '{print $1}' <<< "$sel")
+    [ -z "$V" ] && return 1
+    srpm=$(awk -F'\t' -v v="$V" '$1 == v {print $2; exit}' <<< "$pv")
+    ASSIGN[$primary]=$V
+
+    start_spinner "Matching the rest of the set..."
+    for m in "${SET_NAMES[@]:1}"; do
+        local mv
+        mv=$(dnf_versions "$m")
+        tv=""
+        if [ "${SET_UNIT[$m]}" = "${SET_UNIT[$primary]}" ]; then
+            tv=$(awk -F'\t' -v s="$srpm" '$2 == s {print $1; exit}' <<< "$mv")
+        else
+            # linked by an exact requirement: find the version that requires (or is required at) the chosen ones
+            local cand a req ok
+            for cand in "${SET_VER[$m]}" $(cut -f1 <<< "$mv"); do
+                ok=true
+                req=$(dnf_requires "$m" "$cand")
+                for a in "${!ASSIGN[@]}"; do
+                    local an=${a%.*} want=${ASSIGN[$a]}
+                    if grep -qE "^${an}(\\([^)]*\\))? = " <<< "$req" && ! grep -qE "^${an}(\\([^)]*\\))? = ([0-9]+:)?${want#*:}$" <<< "$req"; then ok=false; fi
+                    local areq
+                    areq=$(dnf_requires "$a" "$want")
+                    if grep -qE "^${m%.*}(\\([^)]*\\))? = " <<< "$areq" && ! grep -qE "^${m%.*}(\\([^)]*\\))? = ([0-9]+:)?${cand#*:}$" <<< "$areq"; then ok=false; fi
+                done
+                if [ "$ok" = true ]; then tv=$cand; break; fi
+            done
+        fi
+        if [ -z "$tv" ]; then
+            stop_spinner
+            echo "No version of $m was found that matches $primary $V."
+            return 1
+        fi
+        ASSIGN[$m]=$tv
+    done
+    stop_spinner
+
+    local -a specs=()
+    echo ""
+    echo "Planned changes (one DNF transaction):"
+    {
+        for m in "${SET_NAMES[@]}"; do
+            if [ "${ASSIGN[$m]}" = "${SET_VER[$m]}" ]; then
+                echo "$m|${SET_VER[$m]} (unchanged)"
+            else
+                echo "$m|${SET_VER[$m]} -> ${ASSIGN[$m]}"
+            fi
+        done
+    } | table | sed 's/^/  /'
+    for m in "${SET_NAMES[@]}"; do
+        [ "${ASSIGN[$m]}" != "${SET_VER[$m]}" ] && specs+=("${m%.*}-${ASSIGN[$m]}.${m##*.}")
+    done
+    if [ ${#specs[@]} -eq 0 ]; then echo "Nothing to change."; return 1; fi
+
+    echo ""
+    read -p "Apply these changes? (y/N): " apply_ans
+    [[ "$apply_ans" =~ ^[Yy]$ ]] || return 1
+
+    # versionlock blocks other versions, so lift locks on the set for the
+    # transaction and put back every lock that was there, whatever happens
+    local -a locked=()
+    for m in "${SET_NAMES[@]}"; do
+        if grep -q "^$m|dnf|" "$HOLD_FILE" || grep -q "^${m%.*}|dnf|" "$HOLD_FILE"; then locked+=("$m"); remove_hold "${m%.*}" dnf; fi
+    done
+    # shellcheck disable=SC2086
+    sudo dnf downgrade -y $TXN_FLAGS "${specs[@]}"
+    local status=$?
+    for m in "${locked[@]}"; do apply_hold "${m%.*}" dnf; done
+    [ $status -eq 0 ] || return 1
+    FINAL_MEMBERS=("${SET_NAMES[@]}")
+    return 0
+}
+
+# --- Flatpak: the NVIDIA GL extension ---
+# Flatpak apps use the org.freedesktop.Platform.GL.nvidia-<version> extension,
+# which must match the host driver exactly. After the host driver changes, the
+# matching extension has to be installed or apps lose GPU acceleration.
+
+nvidia_driver_version() { # type -> upstream driver version of the planned state ("" if no NVIDIA driver)
+    local m v
+    for m in "${FINAL_MEMBERS[@]}"; do
+        case "$1:${m%%:*}" in
+            pacman:nvidia-utils|apt:nvidia-utils-*|apt:libnvidia-gl-*|dnf:xorg-x11-drv-nvidia.*|dnf:nvidia-driver.*)
+                v=${ASSIGN[$m]:-${SET_VER[$m]}}
+                v=${v#*:}; v=${v%-*}
+                echo "$v"; return 0 ;;
+        esac
+    done
+}
+
+flatpak_nvidia_gl_check() { # driver-version
+    local drv=$1 ext ext32 installed
+    [ -n "$drv" ] && command -v flatpak &>/dev/null || return 0
+    installed=$(flatpak list --runtime --columns=application 2>/dev/null)
+    grep -q '^org.freedesktop.Platform.GL.nvidia-' <<< "$installed" || return 0
+    ext="org.freedesktop.Platform.GL.nvidia-${drv//./-}"
+    ext32="org.freedesktop.Platform.GL32.nvidia-${drv//./-}"
+    local -a need=()
+    grep -qxF "$ext" <<< "$installed" || need+=("$ext")
+    if grep -q '^org.freedesktop.Platform.GL32.nvidia-' <<< "$installed" && ! grep -qxF "$ext32" <<< "$installed"; then need+=("$ext32"); fi
+    [ ${#need[@]} -eq 0 ] && return 0
+    echo ""
+    echo "Flatpak apps need ${need[*]} to match the NVIDIA $drv driver."
+    read -p "Install it from Flathub now? (y/N): " gl_ans
+    if [[ "$gl_ans" =~ ^[Yy]$ ]]; then
+        flatpak install -y flathub "${need[@]}"
+    else
+        echo "You can install it later with: flatpak install flathub ${need[*]}"
+    fi
+}
+
 # --- Downgrade Logic ---
 
 perform_downgrade() {
     local pkg=$1
     local type=$2
-    
+
     echo -e "\n--- Downgrading $pkg ---"
-    
+
     # Remember any existing hold so it can be restored if the downgrade fails or is cancelled
     local prev_entry
     prev_entry=$(grep "^$pkg|$type|" "$HOLD_FILE")
-    
+
     sed -i "/^$pkg|$type|/d" "$HOLD_FILE"
     remove_hold "$pkg" "$type"
-    
+
     run_downgrade "$pkg" "$type"
     local status=$?
-    
+
     if [ $status -ne 0 ] && [ -n "$prev_entry" ]; then
         echo "$prev_entry" >> "$HOLD_FILE"
         apply_hold "$pkg" "$type"
         echo "Hold on $pkg ($type) restored."
     fi
-    
+
     return $status
+}
+
+# Roll back a linked set (or a single package) in one transaction.
+# Holds on the set are left as they were if this fails or is cancelled.
+perform_set_downgrade() { # type primary
+    local type=$1 primary=$2
+    if [ ${#SET_NAMES[@]} -gt 1 ]; then
+        echo -e "\n--- Downgrading $primary and $(( ${#SET_NAMES[@]} - 1 )) linked package(s) ---"
+    else
+        echo -e "\n--- Downgrading $primary ---"
+    fi
+    FINAL_MEMBERS=(); EXTRA_NAMES=(); NEEDS_REBOOT=false
+    local status
+    case $type in
+        pacman) pacman_set_downgrade "$primary" ;;
+        apt) apt_set_downgrade "$primary" ;;
+        dnf) dnf_set_downgrade "$primary" ;;
+    esac
+    status=$?
+    if [ $status -ne 0 ]; then
+        local m
+        for m in "${SET_NAMES[@]}"; do
+            if grep -q "^$m|$type|" "$HOLD_FILE"; then echo "Hold on $m ($type) is still in place."; fi
+        done
+        return 1
+    fi
+    flatpak_nvidia_gl_check "$(nvidia_driver_version "$type")"
+    local m
+    for m in "${SET_NAMES[@]}" "${EXTRA_NAMES[@]}"; do
+        [ "${ASSIGN[$m]}" = "${SET_VER[$m]}" ] && continue
+        case "${m%%[:.]*}" in *nvidia*|linux*|kernel*|kmod*) NEEDS_REBOOT=true ;; esac
+    done
+    return 0
 }
 
 run_downgrade() {
     local pkg=$1
     local type=$2
-    
+
     case $type in
         pacman)
-            local try_aur_fallback=false
+            # AUR (foreign) packages: rebuild an older commit from the AUR
+            local orig_dir=$(pwd)
+            local temp_dir=$(mktemp -d)
+            cd "$temp_dir" || return 1
 
-            if pacman -Qm | awk '{print $1}' | grep -qx "$pkg"; then
-                try_aur_fallback=true
+            start_spinner "Cloning AUR repository and fetching commits..."
+            if ! exec_quiet git clone "https://aur.archlinux.org/${pkg}.git" .; then
+                stop_spinner
+                echo -e "\nFailed to clone AUR repository."
+                cd "$orig_dir"
+                rm -rf "$temp_dir"
+                return 1
             else
-		if ! command -v downgrade &> /dev/null; then
-                    start_spinner "Installing 'downgrade' utility..."
-                    exec_quiet sudo pacman -S --noconfirm downgrade
-                    stop_spinner
-                fi
-                
-                sudo downgrade --ignore never "$pkg"
-                
-                if [ $? -eq 0 ]; then
-                    return 0
-                else
-                    read -p "Official archive check failed. Try AUR commit history? (y/N): " fallback_ans
-                    if [[ "$fallback_ans" =~ ^[Yy]$ ]]; then
-                        try_aur_fallback=true
-                    else
-                        return 1
-                    fi
-                fi
-            fi
+                local current_ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
+                local commits=$(git log --pretty=format:"%h | %cd | %s" --date=short 2>/dev/null)
+                stop_spinner
 
-            if [ "$try_aur_fallback" = true ]; then
-                local orig_dir=$(pwd)
-                local temp_dir=$(mktemp -d)
-                cd "$temp_dir" || return 1
-                
-		start_spinner "Cloning AUR repository and fetching commits..."
-                if ! exec_quiet git clone "https://aur.archlinux.org/${pkg}.git" .; then
-                    stop_spinner
-                    echo -e "\nFailed to clone AUR repository."
+                if [ -z "$commits" ]; then
+                    echo -e "\nNo commit history found in the AUR for $pkg."
                     cd "$orig_dir"
                     rm -rf "$temp_dir"
                     return 1
-                else
-                    local current_ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
-                    local commits=$(git log --pretty=format:"%h | %cd | %s" --date=short 2>/dev/null)
-                    stop_spinner
+                fi
 
-                    if [ -z "$commits" ]; then
-                        echo -e "\nNo commit history found in the AUR for $pkg."
+                local selected_commit=$(echo "$commits" | column -t -s '|' | fzf --prompt="Select AUR commit (Esc to cancel) > " --header="Currently installed: $current_ver" --height=15 --layout=reverse)
+
+                if [ -n "$selected_commit" ]; then
+                    local hash=$(echo "$selected_commit" | awk '{print $1}')
+                    exec_quiet git checkout "$hash"
+
+                    echo -e "\nBuilding and installing package..."
+                    if makepkg -si; then
                         cd "$orig_dir"
                         rm -rf "$temp_dir"
-                        return 1
-                    fi
-
-                    local selected_commit=$(echo "$commits" | column -t -s '|' | fzf --prompt="Select AUR commit (Esc to cancel) > " --header="Currently installed: $current_ver" --height=15 --layout=reverse)
-                    
-		    if [ -n "$selected_commit" ]; then
-                        local hash=$(echo "$selected_commit" | awk '{print $1}')
-                        exec_quiet git checkout "$hash"
-                        
-                        echo -e "\nBuilding and installing package..."
-                        if makepkg -si; then
-                            cd "$orig_dir"
-                            rm -rf "$temp_dir"
-                            return 0
-                        else
-                            echo -e "\nError: AUR build or installation failed."
-                            cd "$orig_dir"
-                            rm -rf "$temp_dir"
-                            return 1
-                        fi
+                        return 0
                     else
+                        echo -e "\nError: AUR build or installation failed."
                         cd "$orig_dir"
                         rm -rf "$temp_dir"
                         return 1
                     fi
+                else
+                    cd "$orig_dir"
+                    rm -rf "$temp_dir"
+                    return 1
                 fi
             fi
             ;;
@@ -323,30 +1488,30 @@ run_downgrade() {
             local target_install="system"
             if [ "$type" == "flatpak-user" ]; then target_install="user"; fi
             if [ "$type" == "flatpak" ]; then
-                target_install=$(flatpak list --columns=application,installation | grep -E "^$pkg[[:space:]]" | awk '{print $2}' | head -n 1)
+                target_install=$(flatpak list --columns=application,installation | grep -E "^${pkg}[[:space:]]" | awk '{print $2}' | head -n 1)
             fi
 
-            local flatpak_info=$(flatpak list --columns=application,origin,installation | grep -E "^$pkg[[:space:]]" | grep "$target_install" | head -n 1)
+            local flatpak_info=$(flatpak list --columns=application,origin,installation | grep -E "^${pkg}[[:space:]]" | grep "$target_install" | head -n 1)
             local remote=$(echo "$flatpak_info" | awk '{print $2}')
             local install_type=$(echo "$flatpak_info" | awk '{print $3}')
-            
+
             if [ -z "$remote" ]; then return 1; fi
-            
+
             start_spinner "Fetching Flatpak commit history for $install_type..."
             local raw_log=$(LC_ALL=C flatpak remote-info --log --${install_type} "$remote" "$pkg" 2>/dev/null)
-            
-            if [ -z "$raw_log" ]; then 
+
+            if [ -z "$raw_log" ]; then
                 stop_spinner
                 return 1
             fi
-            
+
             local current_commit=$(flatpak info --show-commit --${install_type} "$pkg" 2>/dev/null)
             local commits=$(echo "$raw_log" | awk '/^[ \t]*Commit:/ {c=$2} /^[ \t]*Date:/ {d=$0; sub(/^[ \t]*Date:[ \t]*/, "", d); print c " | " d}')
             local formatted_commits=$(echo "$commits" | awk -F' \\| ' -v curr="$current_commit" '{ if ($1 == curr) print $1 " | " $2 "  <-- (Installed)"; else print $1 " | " $2 }')
             stop_spinner
 
             local selected_commit=$(echo "$formatted_commits" | column -t -s '|' | fzf --prompt="Select $install_type commit (Esc to cancel) > " --height=15 --layout=reverse)
-            
+
             if [ -n "$selected_commit" ]; then
                 local hash=$(echo "$selected_commit" | awk '{print $1}')
                 if [ "$install_type" == "system" ]; then
@@ -361,7 +1526,7 @@ run_downgrade() {
             ;;
         apt)
             local current_ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
-            
+
             start_spinner "Fetching APT local cache..."
             local versions=$(apt-cache madison "$pkg" | awk '{print $3}')
             local version_count=$(echo "$versions" | wc -w)
@@ -371,7 +1536,7 @@ run_downgrade() {
                 local formatted_versions=$(echo "$versions" | awk -v curr="$current_ver" '{ if ($1 == curr) print $0 "  <-- (Installed)"; else print $0 }')
                 local selected=$(echo "$formatted_versions" | fzf --prompt="Select version (Esc to cancel) > " --height=10 --layout=reverse)
                 local selected_version=$(echo "$selected" | awk '{print $1}')
-                
+
                 if [ -n "$selected_version" ]; then
                     sudo apt-get install -y --allow-downgrades "$pkg=$selected_version"
                     return $?
@@ -382,7 +1547,7 @@ run_downgrade() {
                 echo -e "Only one version found in local APT repositories."
                 read -p "Search the Debian Snapshot Archive (Historical Time Machine)? (y/N): " snap_ans
                 if [[ "$snap_ans" =~ ^[Yy]$ ]]; then
-                    
+
                     start_spinner "Querying Debian Snapshot API for $pkg..."
                     local snap_versions=$(curl -sL "https://snapshot.debian.org/mr/binary/$pkg/" | python3 -c "
 import sys, json
@@ -398,14 +1563,14 @@ except Exception:
                         echo "No historical versions found."
                         return 1
                     fi
-                    
+
                     local formatted_snap=$(echo "$snap_versions" | awk -v curr="$current_ver" '{ if ($1 == curr) print $0 "  <-- (Installed)"; else print $0 }')
                     local selected=$(echo "$formatted_snap" | fzf --prompt="Select historical version (Esc to cancel) > " --height=15 --layout=reverse)
                     local selected_version=$(echo "$selected" | awk '{print $1}')
-                    
+
                     if [ -n "$selected_version" ]; then
                         local arch=$(dpkg --print-architecture)
-                        
+
                         start_spinner "Finding compiled .deb hash for architecture: $arch..."
                         local hash=$(curl -sL "https://snapshot.debian.org/mr/binary/$pkg/$selected_version/binfiles" | python3 -c "
 import sys, json
@@ -419,16 +1584,16 @@ except Exception:
     pass
 " 2>/dev/null)
                         stop_spinner
-                        
+
                         if [ -z "$hash" ]; then
                             echo "Could not find a pre-compiled .deb for $arch."
                             return 1
                         fi
-                        
+
                         echo "Downloading package..."
                         local tmp_deb="/tmp/${pkg}_${selected_version}.deb"
                         wget -q --show-progress "https://snapshot.debian.org/file/$hash" -O "$tmp_deb"
-                        
+
                         if [ -f "$tmp_deb" ]; then
                             echo "Installing package..."
                             sudo dpkg -i "$tmp_deb"
@@ -449,16 +1614,19 @@ except Exception:
             ;;
         dnf)
             start_spinner "Fetching DNF duplicate versions..."
-            local current_ver=$(dnf list installed "$pkg" 2>/dev/null | awk 'NR>1 {print $2}')
-            local versions=$(dnf --showduplicates list "$pkg" | awk 'NR>2 {print $2}')
+            local current_ver=$(dnf list --installed "$pkg" 2>/dev/null | awk 'NF >= 3 && $1 ~ /\./ {print $2; exit}')
+            local versions=$(dnf list --showduplicates "$pkg" 2>/dev/null | awk 'NF >= 3 && $1 ~ /\./ && !seen[$2]++ {print $2}' | sort -Vr)
             local formatted_versions=$(echo "$versions" | awk -v curr="$current_ver" '{ if ($1 == curr) print $0 "  <-- (Installed)"; else print $0 }')
             stop_spinner
-            
+
             local selected=$(echo "$formatted_versions" | fzf --prompt="Select version (Esc to cancel) > " --height=10 --layout=reverse)
             local selected_version=$(echo "$selected" | awk '{print $1}')
-            
+
             if [ -n "$selected_version" ]; then
-                sudo dnf downgrade -y "$pkg-$selected_version"
+                # list_installed gives name.arch; dnf wants name-[epoch:]version-release.arch
+                local dnf_name=$pkg dnf_arch=""
+                if [[ "$pkg" == *.* ]]; then dnf_name=${pkg%.*}; dnf_arch=".${pkg##*.}"; fi
+                sudo dnf downgrade -y "$dnf_name-$selected_version$dnf_arch"
                 return $?
             else
                 return 1
@@ -469,9 +1637,28 @@ except Exception:
 
 # --- Menus ---
 
+# Ask whether to act on the whole linked set; prints "set", "single" or "cancel"
+ask_set_scope() { # type pkg verb
+    local type=$1 pkg=$2 verb=$3
+    if [ ${#SET_NAMES[@]} -le 1 ]; then echo "single"; return; fi
+    {
+        echo ""
+        echo "$pkg is linked to $(( ${#SET_NAMES[@]} - 1 )) other package(s) that must stay on the same version:"
+        print_linked_set
+        echo ""
+    } >&2
+    local ans
+    read -p "$verb all of them together (recommended)? [Y]es / [o]nly $pkg / [c]ancel: " ans
+    case "$ans" in
+        ""|[Yy]*) echo "set" ;;
+        [Oo]*) echo "single" ;;
+        *) echo "cancel" ;;
+    esac
+}
+
 manage_holds() {
     while true; do
-        if [ ! -s "$HOLD_FILE" ]; then 
+        if [ ! -s "$HOLD_FILE" ]; then
             clear
             echo "=== Manage Active Holds ==="
             echo "No holds are currently active."
@@ -481,7 +1668,7 @@ manage_holds() {
         fi
 
         local formatted_list=""
-        while IFS='|' read -r pkg type exp_date; do
+        while IFS='|' read -r pkg type exp_date set; do
             if [ -n "$pkg" ]; then
                 if is_installed "$pkg" "$type"; then
                     local human_date
@@ -490,14 +1677,14 @@ manage_holds() {
                     else
                         human_date=$(date -d "@$exp_date" "+%b %d, %Y %I:%M %p")
                     fi
-                    formatted_list+="$pkg|$type|$human_date\n"
+                    formatted_list+="$pkg|$type|$human_date|${set:--}\n"
                 else
                     sed -i "/^$pkg|$type|/d" "$HOLD_FILE"
                 fi
             fi
         done < "$HOLD_FILE"
 
-        if [ -z "$formatted_list" ]; then 
+        if [ -z "$formatted_list" ]; then
             clear
             echo "=== Manage Active Holds ==="
             echo "No holds are currently active."
@@ -507,12 +1694,25 @@ manage_holds() {
         fi
 
         clear
-        local selected=$(echo -e "$formatted_list" | column -t -s '|' | fzf --prompt="Select hold (Esc to exit) > " --height=15 --layout=reverse --header="PACKAGE  TYPE  EXPIRES")
+        local selected=$(echo -e "$formatted_list" | sed '/^$/d' | awk -F'|' '{print $1 "|" $2 "|" $3 "|" $4}' | column -t -s '|' | fzf --prompt="Select hold (Esc to exit) > " --height=15 --layout=reverse --header="PACKAGE  TYPE  EXPIRES  SET")
 
         if [ -z "$selected" ]; then return; fi
 
         local target_pkg=$(echo "$selected" | awk '{print $1}')
         local target_type=$(echo "$selected" | awk '{print $2}')
+        local target_set=$(hold_line "$target_pkg" "$target_type" | cut -d'|' -f4)
+
+        # A hold that belongs to a linked set is changed for the whole set
+        local -a targets=("$target_pkg")
+        if [ -n "$target_set" ]; then
+            local -a members
+            mapfile -t members < <(hold_set_members "$target_set" "$target_type")
+            if [ ${#members[@]} -gt 1 ]; then
+                echo "$target_pkg is held with its linked set ($target_set): ${members[*]}"
+                read -p "Apply the change to all ${#members[@]} packages (recommended)? (Y/n): " set_ans
+                if [[ ! "$set_ans" =~ ^[Nn]$ ]]; then targets=("${members[@]}"); fi
+            fi
+        fi
 
         local action=$(printf "1. Change duration\n2. Remove hold\n3. Cancel" | fzf --prompt="Action for $target_pkg (Esc to cancel) > " --height=6 --layout=reverse)
 
@@ -520,21 +1720,21 @@ manage_holds() {
             "1. Change duration")
                 read -p "Enter new hold days (0 for indefinite): " new_days
                 if [[ "$new_days" =~ ^[0-9]+$ ]]; then
-                    local new_exp
+                    local new_exp t
                     if [ "$new_days" -eq 0 ]; then
                         new_exp=0
                     else
                         new_exp=$(date -d "+$new_days days" +%s)
                     fi
-                    sed -i "/^$target_pkg|$target_type|/d" "$HOLD_FILE"
-                    echo "$target_pkg|$target_type|$new_exp" >> "$HOLD_FILE"
+                    for t in "${targets[@]}"; do
+                        write_hold_line "$t" "$target_type" "$new_exp" "$(hold_line "$t" "$target_type" | cut -d'|' -f4)"
+                    done
                 fi
                 ;;
             "2. Remove hold")
-                read -p "Remove hold on $target_pkg? (y/n): " confirm
+                read -p "Remove hold on ${targets[*]}? (y/n): " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    remove_hold "$target_pkg" "$target_type"
-                    sed -i "/^$target_pkg|$target_type|/d" "$HOLD_FILE"
+                    unhold_packages "$target_type" "${targets[@]}"
                 fi
                 ;;
             *) continue ;;
@@ -545,21 +1745,15 @@ manage_holds() {
 downgrade_wizard() {
     local PKG_TYPE=$(get_available_managers | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
     if [ -z "$PKG_TYPE" ]; then return; fi
-    
-    local PKG_LIST=""
-    case $PKG_TYPE in
-        flatpak) PKG_LIST=$(flatpak list --columns=application | sort | uniq) ;;
-        apt) PKG_LIST=$(dpkg-query -f '${Package}\n' -W) ;;
-        dnf) PKG_LIST=$(dnf list installed | awk 'NR>1 {print $1}') ;;
-        pacman) PKG_LIST=$(pacman -Qq) ;;
-    esac
-    
+
+    local PKG_LIST=$(list_installed "$PKG_TYPE")
+
     local TARGET_PKG=$(echo "$PKG_LIST" | fzf --prompt="Select package (Esc to cancel) > " --height=15 --layout=reverse)
     if [ -z "$TARGET_PKG" ]; then return; fi
-    
+
     # --- FLATPAK SCOPE RESOLUTION ---
     if [ "$PKG_TYPE" == "flatpak" ]; then
-        local scopes=$(flatpak list --columns=application,installation | grep -E "^$TARGET_PKG[[:space:]]" | awk '{print $2}')
+        local scopes=$(flatpak list --columns=application,installation | grep -E "^${TARGET_PKG}[[:space:]]" | awk '{print $2}')
         if [ "$(echo "$scopes" | wc -w)" -gt 1 ]; then
             local scope_action=$(printf "1. User Level Only\n2. System Level Only\n3. Both" | fzf --prompt="Scope conflict for $TARGET_PKG (Esc to cancel) > " --height=6 --layout=reverse)
             case "$scope_action" in
@@ -574,34 +1768,76 @@ downgrade_wizard() {
     fi
 
     local success=false
+    NEEDS_REBOOT=false
+    local -a hold_pkgs=("$TARGET_PKG")
+    local hold_set=""
     if [ "$PKG_TYPE" == "flatpak-both" ]; then
         perform_downgrade "$TARGET_PKG" "flatpak-user"
         local res1=$?
         perform_downgrade "$TARGET_PKG" "flatpak-system"
         local res2=$?
         if [ $res1 -eq 0 ] || [ $res2 -eq 0 ]; then success=true; fi
+    elif [ "$PKG_TYPE" == "pacman" ] && pacman -Qmq "$TARGET_PKG" &>/dev/null; then
+        # AUR packages are rebuilt one at a time from their AUR history
+        load_linked_set pacman "$TARGET_PKG"
+        if [ ${#SET_NAMES[@]} -gt 1 ]; then
+            echo "Note: $TARGET_PKG is linked to: ${SET_NAMES[*]:1}"
+            echo "AUR packages are rebuilt one at a time, so roll the others back the same way afterwards."
+        fi
+        if perform_downgrade "$TARGET_PKG" "$PKG_TYPE"; then success=true; fi
+    elif [[ "$PKG_TYPE" =~ ^(pacman|apt|dnf)$ ]]; then
+        start_spinner "Looking for packages linked to $TARGET_PKG..."
+        if ! load_linked_set "$PKG_TYPE" "$TARGET_PKG"; then
+            stop_spinner
+            echo "Couldn't read the installed details of $TARGET_PKG."
+            read -p "Press Enter to return to menu..."
+            return
+        fi
+        stop_spinner
+        TARGET_PKG=${SET_NAMES[0]:-$TARGET_PKG}
+        local scope
+        scope=$(ask_set_scope "$PKG_TYPE" "$TARGET_PKG" "Roll back")
+        if [ "$scope" = "single" ] && [ ${#SET_NAMES[@]} -gt 1 ]; then
+            echo "Rolling back only $TARGET_PKG. The package manager may refuse if the others need its exact version."
+            SET_NAMES=("$TARGET_PKG")
+        fi
+        if [ "$scope" != "cancel" ] && perform_set_downgrade "$PKG_TYPE" "$TARGET_PKG"; then
+            success=true
+            hold_pkgs=("${FINAL_MEMBERS[@]}")
+            [ ${#FINAL_MEMBERS[@]} -gt 1 ] && hold_set=$TARGET_PKG
+        fi
     else
         perform_downgrade "$TARGET_PKG" "$PKG_TYPE"
         if [ $? -eq 0 ]; then success=true; fi
     fi
-    
+
     if [ "$success" = true ]; then
         echo ""
-        read -p "Place hold on $TARGET_PKG? (y/N): " hold_ans
+        if [ ${#hold_pkgs[@]} -gt 1 ]; then
+            read -p "Hold all ${#hold_pkgs[@]} packages so they stay on these versions together? (Y/n): " hold_ans
+            [ -z "$hold_ans" ] && hold_ans=y
+        else
+            read -p "Place hold on $TARGET_PKG? (y/N): " hold_ans
+        fi
         if [[ "$hold_ans" =~ ^[Yy]$ ]]; then
             read -p "Days to hold (0 for indefinite) [Default: 7]: " HOLD_DAYS
             local days=${HOLD_DAYS:-7}
+            local p
             if [ "$PKG_TYPE" == "flatpak-both" ]; then
                 add_hold_entry "$TARGET_PKG" "flatpak-user" "$days"
                 add_hold_entry "$TARGET_PKG" "flatpak-system" "$days"
             else
-                add_hold_entry "$TARGET_PKG" "$PKG_TYPE" "$days"
+                for p in "${hold_pkgs[@]}"; do add_hold_entry "$p" "$PKG_TYPE" "$days" "$hold_set"; done
             fi
+        fi
+        if [ "$NEEDS_REBOOT" = true ]; then
+            echo ""
+            echo "Restart your computer when you're ready: the kernel and NVIDIA driver only switch after a reboot."
         fi
     else
         echo -e "\nDowngrade cancelled or failed."
     fi
-    
+
     echo ""
     read -p "Press Enter to return to menu..."
 }
@@ -609,21 +1845,15 @@ downgrade_wizard() {
 create_hold_wizard() {
     local PKG_TYPE=$(get_available_managers | fzf --prompt="Select manager (Esc to cancel) > " --height=10 --layout=reverse)
     if [ -z "$PKG_TYPE" ]; then return; fi
-    
-    local PKG_LIST=""
-    case $PKG_TYPE in
-        flatpak) PKG_LIST=$(flatpak list --columns=application | sort | uniq) ;;
-        apt) PKG_LIST=$(dpkg-query -f '${Package}\n' -W) ;;
-        dnf) PKG_LIST=$(dnf list installed | awk 'NR>1 {print $1}') ;;
-        pacman) PKG_LIST=$(pacman -Qq) ;;
-    esac
-    
+
+    local PKG_LIST=$(list_installed "$PKG_TYPE")
+
     local TARGET_PKG=$(echo "$PKG_LIST" | fzf --prompt="Select package (Esc to cancel) > " --height=15 --layout=reverse)
     if [ -z "$TARGET_PKG" ]; then return; fi
-    
+
     # --- FLATPAK SCOPE RESOLUTION ---
     if [ "$PKG_TYPE" == "flatpak" ]; then
-        local scopes=$(flatpak list --columns=application,installation | grep -E "^$TARGET_PKG[[:space:]]" | awk '{print $2}')
+        local scopes=$(flatpak list --columns=application,installation | grep -E "^${TARGET_PKG}[[:space:]]" | awk '{print $2}')
         if [ "$(echo "$scopes" | wc -w)" -gt 1 ]; then
             local scope_action=$(printf "1. User Level Only\n2. System Level Only\n3. Both" | fzf --prompt="Scope conflict for $TARGET_PKG (Esc to cancel) > " --height=6 --layout=reverse)
             case "$scope_action" in
@@ -637,18 +1867,64 @@ create_hold_wizard() {
         fi
     fi
 
+    # Holding only one package of a linked set lets the rest update without it
+    local -a hold_pkgs=("$TARGET_PKG")
+    local hold_set=""
+    if [[ "$PKG_TYPE" =~ ^(pacman|apt|dnf)$ ]]; then
+        if ! load_linked_set "$PKG_TYPE" "$TARGET_PKG"; then
+            echo "Couldn't read the installed details of $TARGET_PKG."
+            read -p "Press Enter to return to menu..."
+            return
+        fi
+        TARGET_PKG=${SET_NAMES[0]}
+        local scope
+        scope=$(ask_set_scope "$PKG_TYPE" "$TARGET_PKG" "Hold")
+        case "$scope" in
+            cancel) return ;;
+            set) hold_pkgs=("${SET_NAMES[@]}"); hold_set=${SET_NAMES[0]} ;;
+        esac
+    fi
+
     read -p "Days to hold (0 for indefinite) [Default: 7]: " HOLD_DAYS
     local days=${HOLD_DAYS:-7}
-    
+
     if [ "$PKG_TYPE" == "flatpak-both" ]; then
         add_hold_entry "$TARGET_PKG" "flatpak-user" "$days"
         add_hold_entry "$TARGET_PKG" "flatpak-system" "$days"
     else
-        add_hold_entry "$TARGET_PKG" "$PKG_TYPE" "$days"
+        local p
+        for p in "${hold_pkgs[@]}"; do add_hold_entry "$p" "$PKG_TYPE" "$days" "$hold_set"; done
     fi
-    
+
     echo ""
     read -p "Press Enter to return to menu..."
+}
+
+# Read-only report of a package's linked set (and, for pacman, its restore points)
+show_linked() { # type pkg
+    local type=$1 pkg=$2
+    case "$type" in pacman|apt|dnf) ;; *) echo "Manager must be pacman, apt or dnf."; return 1 ;; esac
+    if ! load_linked_set "$type" "$pkg"; then
+        echo "$pkg is not installed ($type)."
+        return 1
+    fi
+    if [ ${#SET_NAMES[@]} -eq 1 ]; then
+        echo "${SET_NAMES[0]} ${SET_VER[${SET_NAMES[0]}]} has no linked packages; it rolls back on its own."
+    else
+        echo "${SET_NAMES[0]} is linked to $(( ${#SET_NAMES[@]} - 1 )) other package(s) that must change together:"
+        print_linked_set
+    fi
+    if [ "$type" = "pacman" ]; then
+        local points
+        points=$(pacman_restore_points)
+        echo ""
+        if [ -n "$points" ]; then
+            echo "Restore points from your pacman history (newest first):"
+            awk -F'\t' '{printf "  %d. Before %s: %s\n", NR, $1, $2}' <<< "$points" | head -n 5
+        else
+            echo "No earlier versions of this set appear in your pacman history."
+        fi
+    fi
 }
 
 # --- Background Check ---
@@ -662,7 +1938,7 @@ check_holds() {
     # Ensure Zenity is installed before attempting any GUI prompts
     if ! command -v zenity &> /dev/null; then
         local missing_action=""
-        
+
         # Check if notify-send supports interactive actions
         if command -v notify-send &> /dev/null && notify-send --help 2>&1 | grep -q -- "--wait"; then
             missing_action=$(notify-send -u critical -a "Rollback Manager" "Error: Missing Dependency" \
@@ -682,7 +1958,7 @@ check_holds() {
             elif command -v dnf &> /dev/null; then
                 install_cmd="sudo dnf install -y zenity"
             fi
-            
+
             if [ -n "$install_cmd" ]; then
                 launch_terminal "echo 'Authenticating to install Zenity...'; $install_cmd"
             else
@@ -696,34 +1972,54 @@ check_holds() {
 
     local current_date=$(date +%s)
     local temp_file=$(mktemp)
-    local expired_pkgs=() expired_types=() expired_exps=() expired_count=0
-    
-    while IFS='|' read -r pkg type exp_date; do
+    local self
+    self=$(realpath "${BASH_SOURCE[0]}")
+
+    # A linked set expires as a whole as soon as any of its holds expires
+    local expired_sets=" "
+    while IFS='|' read -r pkg type exp_date set; do
+        [ -z "$pkg" ] || [ -z "$set" ] && continue
+        if ! is_installed "$pkg" "$type"; then continue; fi
+        if [ "$exp_date" -ne 0 ] && [ "$current_date" -ge "$exp_date" ]; then expired_sets+="$type:$set "; fi
+    done < "$HOLD_FILE"
+
+    # Each prompt covers one unit: a single package, or a whole linked set
+    local unit_keys=() unit_label=() unit_type=() unit_pkgs=() unit_lines=()
+    declare -A unit_index=()
+    local expired_count=0
+    while IFS='|' read -r pkg type exp_date set; do
         if [ -z "$pkg" ]; then continue; fi
         if ! is_installed "$pkg" "$type"; then continue; fi
 
-        # Bypass the expiration check for indefinite holds
-        if [ "$exp_date" -eq 0 ]; then
-            echo "$pkg|$type|$exp_date" >> "$temp_file"
-            continue
+        local line="$pkg|$type|$exp_date${set:+|$set}"
+        local key=""
+        if [ -n "$set" ] && [[ "$expired_sets" == *" $type:$set "* ]]; then
+            key="set:$type:$set"
+        elif [ "$exp_date" -ne 0 ] && [ "$current_date" -ge "$exp_date" ]; then
+            key="pkg:$type:$pkg"
         fi
 
-        if [ "$current_date" -ge "$exp_date" ]; then
-            expired_pkgs+=("$pkg")
-            expired_types+=("$type")
-            expired_exps+=("$exp_date")
-            ((expired_count++))
-        else
-            echo "$pkg|$type|$exp_date" >> "$temp_file"
+        if [ -z "$key" ]; then
+            echo "$line" >> "$temp_file"
+            continue
         fi
+        if [ -z "${unit_index[$key]}" ]; then
+            unit_index[$key]=${#unit_keys[@]}
+            unit_keys+=("$key"); unit_type+=("$type"); unit_pkgs+=(""); unit_lines+=("")
+            if [[ "$key" == set:* ]]; then unit_label+=("the $set set"); else unit_label+=("$pkg"); fi
+            ((expired_count++))
+        fi
+        local i=${unit_index[$key]}
+        unit_pkgs[$i]+="$pkg "
+        unit_lines[$i]+="$line"$'\n'
     done < "$HOLD_FILE"
-    
+
     if [ $expired_count -eq 0 ]; then
         cat "$temp_file" > "$HOLD_FILE"
         rm -f "$temp_file"
         return
     fi
-    
+
     local user_action=""
     local supports_wait=false
 
@@ -735,18 +2031,18 @@ check_holds() {
     if [ "$supports_wait" = true ]; then
         # Use the modern interactive notification
         user_action=$(notify-send -a "Rollback Manager" "Update Holds Expired" \
-            "$expired_count package(s) have reached the end of their hold period." \
+            "$expired_count hold(s) have reached the end of their hold period." \
             --action="default=Review Holds" --action="review=Review Holds" --wait 2>/dev/null)
     else
         # Fallback for lightweight daemons: Send a standard notification so it hits the history/tray
         if command -v notify-send &> /dev/null; then
             notify-send -a "Rollback Manager" "Update Holds Expired" \
-                "$expired_count package(s) have reached the end of their hold period." 2>/dev/null
+                "$expired_count hold(s) have reached the end of their hold period." 2>/dev/null
         fi
-        
+
         # Pop a Zenity dialog as the interactive fallback
         if zenity --question --title="Update Holds Expired" \
-               --text="$expired_count package(s) have reached the end of their hold period.\n\nWould you like to review them now?" \
+               --text="$expired_count hold(s) have reached the end of their hold period.\n\nWould you like to review them now?" \
                --ok-label="Review Holds" --cancel-label="Later" 2>/dev/null; then
             user_action="review"
         else
@@ -755,40 +2051,45 @@ check_holds() {
     fi
 
     if [ "$user_action" != "review" ] && [ "$user_action" != "default" ]; then
-        for i in "${!expired_pkgs[@]}"; do
-            echo "${expired_pkgs[$i]}|${expired_types[$i]}|${expired_exps[$i]}" >> "$temp_file"
+        for i in "${!unit_keys[@]}"; do
+            printf "%s" "${unit_lines[$i]}" >> "$temp_file"
         done
         cat "$temp_file" > "$HOLD_FILE"
         rm -f "$temp_file"
-        return 
+        return
     fi
-    
+
     local pacman_pkgs="" flatpak_pkgs="" flatpak_user_pkgs="" flatpak_system_pkgs="" apt_pkgs="" dnf_pkgs=""
-    
-    for i in "${!expired_pkgs[@]}"; do
-        local p="${expired_pkgs[$i]}"
-        local t="${expired_types[$i]}"
+
+    for i in "${!unit_keys[@]}"; do
+        local label="${unit_label[$i]}"
+        local t="${unit_type[$i]}"
+        local pkgs="${unit_pkgs[$i]}"
+        local text="Hold for $label ($t) has ended. Unhold and update?"
+        if [[ "${unit_keys[$i]}" == set:* ]]; then
+            text="Hold for $label ($t) has ended: ${pkgs% }.\n\nThese packages must stay on the same version, so they are unheld and updated together. Unhold and update?"
+        fi
         while true; do
             zenity --question --title="Hold Expired ($((i+1)) of $expired_count)" \
-                   --text="Hold for $p ($t) has ended. Unhold and update?" \
+                   --text="$text" \
                    --ok-label="Unhold & Update" --cancel-label="Hold longer" 2>/dev/null
-            
+
             if [ $? -eq 0 ]; then
-                echo "$p|$t|${expired_exps[$i]}" >> "$temp_file"
+                printf "%s" "${unit_lines[$i]}" >> "$temp_file"
                 case $t in
-                    pacman) pacman_pkgs+="$p " ;;
-                    flatpak) flatpak_pkgs+="$p " ;;
-                    flatpak-user) flatpak_user_pkgs+="$p " ;;
-                    flatpak-system) flatpak_system_pkgs+="$p " ;;
-                    apt) apt_pkgs+="$p " ;;
-                    dnf) dnf_pkgs+="$p " ;;
+                    pacman) pacman_pkgs+="$pkgs" ;;
+                    flatpak) flatpak_pkgs+="$pkgs" ;;
+                    flatpak-user) flatpak_user_pkgs+="$pkgs" ;;
+                    flatpak-system) flatpak_system_pkgs+="$pkgs" ;;
+                    apt) apt_pkgs+="$pkgs" ;;
+                    dnf) dnf_pkgs+="$pkgs" ;;
                 esac
-                break 
+                break
             else
                 local extend_days=$(zenity --entry --title="Extend Hold" \
-                    --text="Days to hold (0 for indefinite) $p? (Blank for default: $DEFAULT_EXTEND_DAYS)" \
+                    --text="Days to hold (0 for indefinite) $label? (Blank for default: $DEFAULT_EXTEND_DAYS)" \
                     --entry-text="$DEFAULT_EXTEND_DAYS" 2>/dev/null)
-                
+
                 if [ $? -eq 0 ]; then
                     local days=${extend_days:-$DEFAULT_EXTEND_DAYS}
                     if [[ "$days" =~ ^[0-9]+$ ]]; then
@@ -798,8 +2099,11 @@ check_holds() {
                         else
                             new_exp=$(date -d "+$days days" +%s)
                         fi
-                        echo "$p|$t|$new_exp" >> "$temp_file"
-                        break 
+                        while IFS='|' read -r p pt _ ps; do
+                            [ -z "$p" ] && continue
+                            echo "$p|$pt|$new_exp${ps:+|$ps}" >> "$temp_file"
+                        done <<< "${unit_lines[$i]}"
+                        break
                     fi
                 else
                     continue
@@ -807,16 +2111,16 @@ check_holds() {
             fi
         done
     done
-    
+
     cat "$temp_file" > "$HOLD_FILE"
     rm -f "$temp_file"
-    
+
     local update_cmd=""
 	if [ -n "$pacman_pkgs$flatpak_pkgs$flatpak_user_pkgs$flatpak_system_pkgs$apt_pkgs$dnf_pkgs" ]; then
         update_cmd="echo 'Authenticating...'; sudo -v; "
-        
+
         if [ -n "$pacman_pkgs" ]; then
-            for p in $pacman_pkgs; do update_cmd+="sudo bash -c \"sed -i 's/[[:space:]]*\\\\\b${p}\\\\\b//g' /etc/pacman.conf\" && sed -i \"/^${p}|pacman|/d\" \"$HOLD_FILE\" ; "; done
+            update_cmd+="'$self' __unhold pacman $pacman_pkgs; "
             update_cmd+="sudo pacman -S $pacman_pkgs; "
         fi
         if [ -n "$flatpak_user_pkgs" ]; then
@@ -828,7 +2132,7 @@ check_holds() {
             update_cmd+="flatpak update -y --system $flatpak_system_pkgs; "
         fi
         if [ -n "$flatpak_pkgs" ]; then
-            for p in $flatpak_pkgs; do 
+            for p in $flatpak_pkgs; do
                 update_cmd+="if flatpak list --columns=application,installation | grep -E \"^${p}[[:space:]]\" | grep -q \"user\"; then flatpak mask --remove --user ${p} $REDIRECT; fi; "
                 update_cmd+="if flatpak list --columns=application,installation | grep -E \"^${p}[[:space:]]\" | grep -q \"system\"; then sudo flatpak mask --remove --system ${p} $REDIRECT; fi; "
                 update_cmd+="sed -i \"/^${p}|flatpak|/d\" \"$HOLD_FILE\" ; "
@@ -840,10 +2144,10 @@ check_holds() {
             update_cmd+="sudo apt-get --only-upgrade install -y $apt_pkgs; "
         fi
         if [ -n "$dnf_pkgs" ]; then
-            for p in $dnf_pkgs; do update_cmd+="sudo dnf versionlock delete ${p} $REDIRECT && sed -i \"/^${p}|dnf|/d\" \"$HOLD_FILE\" ; "; done
+            for p in $dnf_pkgs; do update_cmd+="sudo dnf versionlock delete $(dnf_lock_name "$p") $REDIRECT && sed -i \"/^${p}|dnf|/d\" \"$HOLD_FILE\" ; "; done
             update_cmd+="sudo dnf upgrade -y $dnf_pkgs; "
         fi
-        
+
         update_cmd=$(printf "%s" "$update_cmd" | sed 's/[[:space:];]*$//')
         launch_terminal "$update_cmd"
     fi
@@ -851,39 +2155,60 @@ check_holds() {
 
 # --- Execution ---
 
-if [ "$1" == "check" ]; then
-    check_holds
-else
-    setup_systemd_timer
-
-    # Ensure fzf is installed before launching the interactive UI
-    if ! command -v fzf &> /dev/null; then
-        echo -e "Error: 'fzf' is required for the interactive menu.\n"
-        read -p "Would you like to install it now? (y/N): " install_fzf
-        if [[ "$install_fzf" =~ ^[Yy]$ ]]; then
-            if command -v pacman &> /dev/null; then sudo pacman -S --noconfirm fzf;
-            elif command -v apt-get &> /dev/null; then sudo apt-get install -y fzf;
-            elif command -v dnf &> /dev/null; then sudo dnf install -y fzf;
-            else echo "Please install fzf manually."; exit 1; fi
-        else
-            exit 1
-        fi
-    fi
-
-    # Set the terminal tab title to rollback-mgr
-    printf "\033]0;rollback-mgr\007"
-    
-    # Ensure the title clears if the user exits or hits Ctrl+C
-    trap 'printf "\033]0;\007"; exit 0' EXIT INT TERM
-
-    while true; do
-        clear
-        action=$(printf "1. Create new hold\n2. Manage active holds\n3. Downgrade package\n4. Exit" | fzf --prompt="Select action (Esc to cancel) > " --height=8 --layout=reverse)
-        case "$action" in
-            "1. Create new hold") create_hold_wizard ;;
-            "2. Manage active holds") manage_holds ;;
-            "3. Downgrade package") downgrade_wizard ;;
-            *) exit 0 ;;
-        esac
-    done
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    # Sourced (by the tests): define the functions only
+    return 0 2>/dev/null
 fi
+
+trap cleanup_tmp EXIT
+
+case "$1" in
+    check)
+        check_holds
+        exit $?
+        ;;
+    linked)
+        if [ $# -ne 3 ]; then usage; exit 1; fi
+        show_linked "$2" "$3"
+        exit $?
+        ;;
+    __unhold)
+        # used by the expiry update terminal
+        shift
+        unhold_packages "$@"
+        exit $?
+        ;;
+esac
+
+setup_systemd_timer
+
+# Ensure fzf is installed before launching the interactive UI
+if ! command -v fzf &> /dev/null; then
+    echo -e "Error: 'fzf' is required for the interactive menu.\n"
+    read -p "Would you like to install it now? (y/N): " install_fzf
+    if [[ "$install_fzf" =~ ^[Yy]$ ]]; then
+        if command -v pacman &> /dev/null; then sudo pacman -S --noconfirm fzf;
+        elif command -v apt-get &> /dev/null; then sudo apt-get install -y fzf;
+        elif command -v dnf &> /dev/null; then sudo dnf install -y fzf;
+        else echo "Please install fzf manually."; exit 1; fi
+    else
+        exit 1
+    fi
+fi
+
+# Set the terminal tab title to rollback-mgr
+printf "\033]0;rollback-mgr\007"
+
+# Ensure the title clears if the user exits or hits Ctrl+C
+trap 'printf "\033]0;\007"; cleanup_tmp; exit 0' EXIT INT TERM
+
+while true; do
+    clear
+    action=$(printf "1. Create new hold\n2. Manage active holds\n3. Downgrade package\n4. Exit" | fzf --prompt="Select action (Esc to cancel) > " --height=8 --layout=reverse)
+    case "$action" in
+        "1. Create new hold") create_hold_wizard ;;
+        "2. Manage active holds") manage_holds ;;
+        "3. Downgrade package") downgrade_wizard ;;
+        *) exit 0 ;;
+    esac
+done
